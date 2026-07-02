@@ -1,0 +1,10 @@
+# 환경·비밀
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# IDE
+.idea/

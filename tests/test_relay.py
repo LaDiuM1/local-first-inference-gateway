@@ -1,5 +1,7 @@
 """chat completions 투명 중계 계약 테스트 — 업스트림(Ollama)은 respx로 목킹한다."""
 
+from collections.abc import AsyncIterator
+
 import httpx
 import pytest
 import respx
@@ -88,3 +90,82 @@ async def test_relay_drops_hop_by_hop_headers(
 
     assert "transfer-encoding" not in response.headers
     assert response.headers["x-request-id"] == "abc"
+
+
+SSE_CHUNKS = [
+    b'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n',
+    b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+    b"data: [DONE]\n\n",
+]
+
+
+class ChunkedStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+
+
+@respx.mock
+async def test_stream_relay_passes_sse_bytes_through(
+    gateway_client: httpx.AsyncClient,
+) -> None:
+    route = respx.post(UPSTREAM_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkedStream(SSE_CHUNKS),
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+    raw_request = b'{"model":"gemma4:12b-it-qat","stream":true}'
+
+    received = b""
+    async with gateway_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        content=raw_request,
+        headers={"content-type": "application/json"},
+    ) as response:
+        async for chunk in response.aiter_raw():
+            received += chunk
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/event-stream"
+    assert received == b"".join(SSE_CHUNKS)
+    assert route.calls.last.request.content == raw_request
+
+
+@respx.mock
+async def test_stream_relay_synthesizes_502_when_upstream_unreachable(
+    gateway_client: httpx.AsyncClient,
+) -> None:
+    respx.post(UPSTREAM_URL).mock(side_effect=httpx.ConnectError("connection refused"))
+
+    response = await gateway_client.post(
+        "/v1/chat/completions", json={**CHAT_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_unavailable"
+
+
+@pytest.mark.parametrize(
+    "broken_body", [b'{"model": broken', b"[1, 2]", b'"just a string"']
+)
+@respx.mock
+async def test_invalid_json_gets_400_without_upstream_call(
+    gateway_client: httpx.AsyncClient, broken_body: bytes
+) -> None:
+    route = respx.post(UPSTREAM_URL)
+
+    response = await gateway_client.post(
+        "/v1/chat/completions",
+        content=broken_body,
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert not route.called

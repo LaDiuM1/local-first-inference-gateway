@@ -17,7 +17,7 @@ import openai
 GATEWAY_HOST = "127.0.0.1"
 GATEWAY_PORT = 8000
 GATEWAY_BASE_URL = f"http://{GATEWAY_HOST}:{GATEWAY_PORT}"
-CHAT_MODEL = "gemma4:12b-it-qat"
+CHAT_ALIAS = "chat"
 STARTUP_TIMEOUT_SECONDS = 15
 REQUEST_TIMEOUT_SECONDS = 120
 
@@ -69,15 +69,15 @@ try:
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
 
+    # 기본이 일반 모드(사고 없음)이므로 별도 옵션 없이 빠른 응답을 받는다.
     completion = client.chat.completions.create(
-        model=CHAT_MODEL,
+        model=CHAT_ALIAS,
         messages=[
             {
                 "role": "user",
                 "content": "게이트웨이 점검용 요청이다. 한 문장으로 답하라.",
             }
         ],
-        extra_body={"reasoning_effort": "none"},
     )
     answer = completion.choices[0].message.content or ""
     check(
@@ -91,16 +91,16 @@ try:
         usage_total = completion.usage.total_tokens
     check("사용량 집계 수신", usage_total > 0, f"총 {usage_total} 토큰")
 
-    # 2. 업스트림 에러 투명 전달 — 없는 모델 요청이 OpenAI 포맷 에러로 SDK에 해석돼야 한다.
+    # 2. 미등록 별칭 거절 — 게이트웨이 400이 OpenAI 포맷 에러로 SDK에 해석돼야 한다.
     try:
         client.chat.completions.create(
             model="no-such-model", messages=[{"role": "user", "content": "x"}]
         )
-        check("업스트림 에러 투명 전달", False, "에러 없이 성공해버림")
+        check("미등록 별칭 400 거절", False, "에러 없이 성공해버림")
     except openai.APIStatusError as error:
         check(
-            "업스트림 에러 투명 전달",
-            400 <= error.status_code < 500,
+            "미등록 별칭 400 거절",
+            error.status_code == 400,
             f"HTTP {error.status_code}, SDK가 OpenAI 에러로 해석",
         )
 finally:

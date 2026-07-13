@@ -2,7 +2,7 @@
 
 검증 기준(docs/ROADMAP.md 3단계):
 - 클라이언트에서 응답을 토큰 단위로 순차 수신하는지 확인
-  (gemma4는 thinking이 기본이라 content 앞에 reasoning 델타가 먼저 흐른다 — 전체 델타 기준으로 검증)
+  (기본이 일반 모드라 사고 델타 없이 content 델타가 시간축에 분산되는지로 검증)
 
 실행 전제: Ollama 기동 상태(gemma4:12b-it-qat 사용 가능). 게이트웨이는 스크립트가 직접 띄운다.
 실행: uv run python scripts/verify_stage3.py
@@ -18,7 +18,7 @@ import openai
 GATEWAY_HOST = "127.0.0.1"
 GATEWAY_PORT = 8000
 GATEWAY_BASE_URL = f"http://{GATEWAY_HOST}:{GATEWAY_PORT}"
-CHAT_MODEL = "gemma4:12b-it-qat"
+CHAT_ALIAS = "chat"
 STARTUP_TIMEOUT_SECONDS = 15
 REQUEST_TIMEOUT_SECONDS = 180
 
@@ -72,7 +72,7 @@ try:
 
     started = time.perf_counter()
     stream = client.chat.completions.create(
-        model=CHAT_MODEL,
+        model=CHAT_ALIAS,
         messages=[
             {
                 "role": "user",
@@ -83,25 +83,21 @@ try:
     )
 
     delta_seconds: list[float] = []
-    first_content_second: float | None = None
     content = ""
     for chunk in stream:
         elapsed = time.perf_counter() - started
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
-        # gemma4는 thinking이 기본이라 content 앞에 reasoning 델타가 먼저 흐른다
-        if delta.content or getattr(delta, "reasoning", None):
-            delta_seconds.append(elapsed)
+        # 기본이 일반 모드라 사고 델타 없이 content 델타가 흐른다
         if delta.content:
+            delta_seconds.append(elapsed)
             content += delta.content
-            if first_content_second is None:
-                first_content_second = elapsed
 
     check(
         "스트림 델타 수신",
         len(delta_seconds) > 1 and bool(content.strip()),
-        f"델타 {len(delta_seconds)}개, content {len(content)}자",
+        f"content 델타 {len(delta_seconds)}개, content {len(content)}자",
     )
 
     if delta_seconds:
@@ -112,10 +108,6 @@ try:
             "토큰 단위 순차 수신",
             spread > last * 0.5,
             f"첫 델타 {first:.2f}s, 마지막 {last:.2f}s — 수신 구간 {spread:.2f}s",
-        )
-    if first_content_second is not None:
-        print(
-            f"(참고) 첫 content 델타 {first_content_second:.2f}s — thinking 구간 이후 시작"
         )
 
     # 2. 형식이 깨진 요청은 게이트웨이가 OpenAI 규격 400으로 직접 거절한다(3단계 의결).

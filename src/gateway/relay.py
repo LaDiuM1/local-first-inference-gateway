@@ -1,15 +1,25 @@
-"""Ollama의 OpenAI 호환 경로로의 중계.
+"""chat completions 별칭 라우팅 중계.
 
-요청·응답 본문은 원문 바이트 그대로 전달한다. 게이트웨이가 직접 응답하는
-경우는 둘뿐이다 — 형식이 깨진 요청의 400 거절, 업스트림 연결 실패의 502 합성.
+요청에 `reasoning_effort`가 없으면 기본 일반 모드(`none`)를 넣고, 있으면 비어 있지 않은
+문자열만 그대로 업스트림에 전달한다. 이어서 `model` 별칭을 실제 모델명으로 치환하며, 나머지
+클라이언트 필드는 그대로 업스트림에 전달한다. stream 여부와 무관하게 동일한 규칙을 적용한다.
+게이트웨이가 직접 응답하는 경우는 계약 위반 요청의 400, 업스트림 연결 실패의 502뿐이다.
 """
 
 import json
 
 import httpx
 from fastapi import Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
+
+from gateway.errors import (
+    InvalidRequestError,
+    invalid_request_response,
+    upstream_unavailable_response,
+)
+from gateway.routing import EndpointKind, RoutingTable
+from gateway.validation import load_json_object, require_string
 
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 
@@ -29,24 +39,38 @@ HOP_BY_HOP_HEADERS = {
 EXCLUDED_BUFFERED_HEADERS = HOP_BY_HOP_HEADERS | {"content-length", "content-encoding"}
 EXCLUDED_STREAMING_HEADERS = HOP_BY_HOP_HEADERS | {"content-length"}
 
+REASONING_EFFORT_FIELD = "reasoning_effort"
+NORMAL_MODE_EFFORT = "none"
 
-async def relay_chat_completions(upstream: httpx.AsyncClient, body: bytes) -> Response:
-    """stream 여부에 따라 중계 경로를 고르고, 요청 원문과 응답을 그대로 전달한다."""
+
+async def relay_chat_completions(
+    upstream: httpx.AsyncClient, routing: RoutingTable, body: bytes
+) -> Response:
+    """사고 수준을 확정하고 별칭을 치환한 뒤 stream 여부에 따라 중계 경로를 고른다."""
     try:
-        wants_stream = _parse_stream_flag(body)
-    except ValueError:
-        return _invalid_request_response()
+        payload = load_json_object(body)
+        _apply_reasoning_effort(payload)
+        alias = require_string(payload, "model")
+        payload["model"] = routing.resolve(EndpointKind.chat, alias)
+    except InvalidRequestError as error:
+        return invalid_request_response(error.message)
 
-    if wants_stream:
-        return await _relay_streaming(upstream, body)
-    return await _relay_buffered(upstream, body)
+    routed_body = json.dumps(payload).encode("utf-8")
+    if payload.get("stream"):
+        return await _relay_streaming(upstream, routed_body)
+    return await _relay_buffered(upstream, routed_body)
 
 
-def _parse_stream_flag(body: bytes) -> bool:
-    payload = json.loads(body)
-    if not isinstance(payload, dict):
-        raise ValueError("request body is not a JSON object")
-    return bool(payload.get("stream"))
+def _apply_reasoning_effort(payload: dict) -> None:
+    """업스트림에 전달할 `reasoning_effort`를 확정한다.
+
+    필드가 없으면 기본 일반 모드(`none`)를 넣고, 있으면 비어 있지 않은 문자열만 클라이언트가
+    보낸 값 그대로 업스트림에 전달한다. 비문자열·빈 문자열은 OpenAI 규격 400으로 거절한다.
+    """
+    if REASONING_EFFORT_FIELD not in payload:
+        payload[REASONING_EFFORT_FIELD] = NORMAL_MODE_EFFORT
+        return
+    payload[REASONING_EFFORT_FIELD] = require_string(payload, REASONING_EFFORT_FIELD)
 
 
 async def _relay_buffered(upstream: httpx.AsyncClient, body: bytes) -> Response:
@@ -57,7 +81,7 @@ async def _relay_buffered(upstream: httpx.AsyncClient, body: bytes) -> Response:
             headers={"content-type": "application/json"},
         )
     except httpx.RequestError as error:
-        return _upstream_unavailable_response(error)
+        return upstream_unavailable_response(error)
 
     return Response(
         content=upstream_response.content,
@@ -76,7 +100,7 @@ async def _relay_streaming(upstream: httpx.AsyncClient, body: bytes) -> Response
     try:
         upstream_response = await upstream.send(stream_request, stream=True)
     except httpx.RequestError as error:
-        return _upstream_unavailable_response(error)
+        return upstream_unavailable_response(error)
 
     return StreamingResponse(
         upstream_response.aiter_raw(),
@@ -94,31 +118,3 @@ def _relayed_headers(
         for name, value in upstream_response.headers.items()
         if name.lower() not in excluded
     }
-
-
-def _invalid_request_response() -> JSONResponse:
-    return JSONResponse(
-        status_code=400,
-        content={
-            "error": {
-                "message": "request body is not a valid JSON object",
-                "type": "invalid_request_error",
-                "param": None,
-                "code": None,
-            }
-        },
-    )
-
-
-def _upstream_unavailable_response(error: httpx.RequestError) -> JSONResponse:
-    return JSONResponse(
-        status_code=502,
-        content={
-            "error": {
-                "message": f"upstream connection failed: {type(error).__name__}",
-                "type": "upstream_error",
-                "param": None,
-                "code": "upstream_unavailable",
-            }
-        },
-    )

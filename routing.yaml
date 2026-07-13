@@ -1,0 +1,13 @@
+# 용도별 별칭 → 실제 모델 라우팅.
+# 클라이언트(openAt)는 이 별칭만 호출하고, 실제 모델의 선택과 교체는 이 파일 수정으로만 이뤄진다.
+# endpoint는 별칭이 서비스하는 OpenAI 엔드포인트다 — chat(=/v1/chat/completions), embeddings(=/v1/embeddings).
+routes:
+  - alias: chat
+    endpoint: chat
+    model: gemma4:12b-it-qat
+  - alias: vision
+    endpoint: chat
+    model: gemma4:12b-it-qat
+  - alias: embed
+    endpoint: embeddings
+    model: snowflake-arctic-embed2

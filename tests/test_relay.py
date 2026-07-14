@@ -40,7 +40,7 @@ async def test_relay_returns_upstream_body_unchanged(
 async def test_relay_substitutes_alias_and_preserves_other_fields(
     gateway_client: httpx.AsyncClient,
 ) -> None:
-    route = respx.post(UPSTREAM_URL).respond(200, json={})
+    route = respx.post(UPSTREAM_URL).respond(200, json={"choices": []})
 
     await gateway_client.post(
         "/v1/chat/completions",
@@ -61,7 +61,7 @@ async def test_relay_substitutes_alias_and_preserves_other_fields(
 async def test_reasoning_effort_omitted_defaults_to_none(
     gateway_client: httpx.AsyncClient,
 ) -> None:
-    route = respx.post(UPSTREAM_URL).respond(200, json={})
+    route = respx.post(UPSTREAM_URL).respond(200, json={"choices": []})
 
     await gateway_client.post("/v1/chat/completions", json=CHAT_REQUEST)
 
@@ -69,12 +69,26 @@ async def test_reasoning_effort_omitted_defaults_to_none(
     assert forwarded["reasoning_effort"] == "none"
 
 
+@respx.mock
+async def test_explicit_stream_false_uses_buffered_path(
+    gateway_client: httpx.AsyncClient,
+) -> None:
+    route = respx.post(UPSTREAM_URL).respond(200, json={"choices": []})
+
+    response = await gateway_client.post(
+        "/v1/chat/completions", json={**CHAT_REQUEST, "stream": False}
+    )
+
+    assert response.status_code == 200
+    assert json.loads(route.calls.last.request.content)["stream"] is False
+
+
 @pytest.mark.parametrize("effort", ["high", "medium", "low", "max", "none"])
 @respx.mock
 async def test_reasoning_effort_string_passed_through(
     gateway_client: httpx.AsyncClient, effort: str
 ) -> None:
-    route = respx.post(UPSTREAM_URL).respond(200, json={})
+    route = respx.post(UPSTREAM_URL).respond(200, json={"choices": []})
 
     await gateway_client.post(
         "/v1/chat/completions", json={**CHAT_REQUEST, "reasoning_effort": effort}
@@ -108,7 +122,7 @@ async def test_invalid_reasoning_effort_gets_400_without_upstream_call(
 async def test_vision_alias_maps_to_configured_model(
     gateway_client: httpx.AsyncClient,
 ) -> None:
-    route = respx.post(UPSTREAM_URL).respond(200, json={})
+    route = respx.post(UPSTREAM_URL).respond(200, json={"choices": []})
 
     await gateway_client.post(
         "/v1/chat/completions", json={**CHAT_REQUEST, "model": "vision"}
@@ -118,9 +132,11 @@ async def test_vision_alias_maps_to_configured_model(
     assert forwarded["model"] == CHAT_MODEL
 
 
-@pytest.mark.parametrize("status_code", [400, 404, 500])
+# 폴백 대상이 아닌 로컬 4xx(모델 부재 404 제외)는 로컬이 판단한 클라이언트 오류이므로 그대로 전달한다.
+# 폴백 대상 상태(404·429·5xx)와 연결 실패의 우회는 test_fallback.py에서 검증한다.
+@pytest.mark.parametrize("status_code", [400, 401, 403, 422])
 @respx.mock
-async def test_relay_passes_upstream_error_through(
+async def test_relay_passes_non_fallback_error_through(
     gateway_client: httpx.AsyncClient, status_code: int
 ) -> None:
     error_body = b'{"error":{"message":"upstream says no"}}'
@@ -135,29 +151,25 @@ async def test_relay_passes_upstream_error_through(
 
 
 @respx.mock
-async def test_relay_synthesizes_502_when_upstream_unreachable(
-    gateway_client: httpx.AsyncClient,
-) -> None:
-    respx.post(UPSTREAM_URL).mock(side_effect=httpx.ConnectError("connection refused"))
-
-    response = await gateway_client.post("/v1/chat/completions", json=CHAT_REQUEST)
-
-    assert response.status_code == 502
-    error = response.json()["error"]
-    assert error["code"] == "upstream_unavailable"
-
-
-@respx.mock
 async def test_relay_drops_hop_by_hop_headers(
     gateway_client: httpx.AsyncClient,
 ) -> None:
     respx.post(UPSTREAM_URL).respond(
-        200, json={}, headers={"transfer-encoding": "chunked", "x-request-id": "abc"}
+        200,
+        json={"choices": []},
+        headers={
+            "connection": " X-Internal , keep-alive ",
+            "transfer-encoding": "chunked",
+            "x-internal": "must-not-leak",
+            "x-request-id": "abc",
+        },
     )
 
     response = await gateway_client.post("/v1/chat/completions", json=CHAT_REQUEST)
 
     assert "transfer-encoding" not in response.headers
+    assert "connection" not in response.headers
+    assert "x-internal" not in response.headers
     assert response.headers["x-request-id"] == "abc"
 
 
@@ -185,7 +197,11 @@ async def test_stream_relay_substitutes_alias_and_passes_sse_bytes_through(
         return_value=httpx.Response(
             200,
             stream=ChunkedStream(SSE_CHUNKS),
-            headers={"content-type": "text/event-stream"},
+            headers={
+                "connection": "x-internal",
+                "content-type": "text/event-stream",
+                "x-internal": "must-not-leak",
+            },
         )
     )
 
@@ -200,6 +216,8 @@ async def test_stream_relay_substitutes_alias_and_passes_sse_bytes_through(
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "text/event-stream"
+    assert "connection" not in response.headers
+    assert "x-internal" not in response.headers
     assert received == b"".join(SSE_CHUNKS)
     forwarded = json.loads(route.calls.last.request.content)
     assert forwarded["model"] == CHAT_MODEL
@@ -248,24 +266,28 @@ async def test_stream_relay_rejects_invalid_reasoning_effort_without_upstream_ca
     assert not route.called
 
 
-@respx.mock
-async def test_stream_relay_synthesizes_502_when_upstream_unreachable(
-    gateway_client: httpx.AsyncClient,
-) -> None:
-    respx.post(UPSTREAM_URL).mock(side_effect=httpx.ConnectError("connection refused"))
-
-    response = await gateway_client.post(
-        "/v1/chat/completions", json={**CHAT_REQUEST, "stream": True}
-    )
-
-    assert response.status_code == 502
-    assert response.json()["error"]["code"] == "upstream_unavailable"
-
-
 @pytest.mark.parametrize(
     "broken_body",
-    [b'{"model": broken', b"[1, 2]", b'"just a string"', b"\xff\xfe"],
-    ids=["malformed-json", "json-array", "json-string", "invalid-utf8"],
+    [
+        b'{"model": broken',
+        b"[1, 2]",
+        b'"just a string"',
+        b"\xff\xfe",
+        b'{"model":"chat","messages":[],"value":NaN}',
+        b'{"model":"chat","messages":[],"value":Infinity}',
+        b'{"model":"chat","messages":[],"value":-Infinity}',
+        b'{"model":"chat","messages":[],"value":1e400}',
+    ],
+    ids=[
+        "malformed-json",
+        "json-array",
+        "json-string",
+        "invalid-utf8",
+        "nan-constant",
+        "infinity-constant",
+        "negative-infinity-constant",
+        "overflow-number",
+    ],
 )
 @respx.mock
 async def test_invalid_json_gets_400_without_upstream_call(

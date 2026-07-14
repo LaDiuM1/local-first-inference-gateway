@@ -12,11 +12,14 @@
 - embed 별칭 임베딩 — 단건/배열 응답, 1024 차원, 입력 순서·인덱스 보존, 임베딩 모델 CPU 상주
 - encoding_format — 기본 float 리스트, base64는 SDK가 되돌릴 수 있는 float32 리틀엔디언 바이트
 
-실행 전제: Ollama 기동 상태(gemma4:12b-it-qat, snowflake-arctic-embed2 사용 가능). 게이트웨이는 스크립트가 직접 띄운다.
+실행 전제: 채팅 Ollama(기본 11434, gemma4:12b-it-qat)와 CPU 임베딩 Ollama
+(기본 11435, snowflake-arctic-embed2)가 각각 기동된 상태. 게이트웨이는 스크립트가 직접 띄우며
+실 OpenAI 폴백은 비활성화한다.
 실행: uv run python scripts/verify_stage4.py
 """
 
 import base64
+import os
 import struct
 import subprocess
 import sys
@@ -28,7 +31,12 @@ import openai
 GATEWAY_HOST = "127.0.0.1"
 GATEWAY_PORT = 8000
 GATEWAY_BASE_URL = f"http://{GATEWAY_HOST}:{GATEWAY_PORT}"
-OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+CHAT_OLLAMA_BASE_URL = os.environ.get(
+    "GATEWAY_OLLAMA_BASE_URL", "http://127.0.0.1:11434"
+).rstrip("/")
+EMBEDDING_OLLAMA_BASE_URL = os.environ.get(
+    "GATEWAY_EMBEDDING_OLLAMA_BASE_URL", "http://127.0.0.1:11435"
+).rstrip("/")
 CHAT_ALIAS = "chat"
 EMBED_ALIAS = "embed"
 CHAT_MODEL = "gemma4:12b-it-qat"
@@ -49,7 +57,23 @@ def check(label: str, passed: bool, detail: str) -> None:
         failures.append(label)
 
 
+def stop_gateway(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
 def start_gateway() -> subprocess.Popen:
+    environment = os.environ.copy()
+    # 라이브 검증은 로컬 Ollama만 대상으로 한다. 저장소 .env에 키가 있어도 외부로 우회하지 않는다.
+    environment["OPENAI_API_KEY"] = ""
+    environment["GATEWAY_OLLAMA_BASE_URL"] = CHAT_OLLAMA_BASE_URL
+    environment["GATEWAY_EMBEDDING_OLLAMA_BASE_URL"] = EMBEDDING_OLLAMA_BASE_URL
     process = subprocess.Popen(
         [
             sys.executable,
@@ -62,7 +86,8 @@ def start_gateway() -> subprocess.Popen:
             str(GATEWAY_PORT),
             "--log-level",
             "warning",
-        ]
+        ],
+        env=environment,
     )
     deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
@@ -72,8 +97,11 @@ def start_gateway() -> subprocess.Popen:
                 return process
         except httpx.TransportError:
             time.sleep(0.3)
-    process.terminate()
-    raise RuntimeError("게이트웨이가 기동하지 않는다")
+    stop_gateway(process)
+    raise RuntimeError(
+        "게이트웨이가 기동하지 않는다 "
+        f"(chat={CHAT_OLLAMA_BASE_URL}, embedding={EMBEDDING_OLLAMA_BASE_URL})"
+    )
 
 
 def stream_reasoning_and_content(
@@ -226,7 +254,7 @@ try:
 
     # 8. 임베딩 모델 CPU 상주 — native /api/embed의 num_gpu:0이 실제로 반영됐는지 확인한다.
     resident = {}
-    for model in httpx.get(f"{OLLAMA_BASE_URL}/api/ps").json()["models"]:
+    for model in httpx.get(f"{EMBEDDING_OLLAMA_BASE_URL}/api/ps").json()["models"]:
         resident[model["name"].removesuffix(":latest")] = model
     if EMBED_MODEL in resident:
         embed_state = resident[EMBED_MODEL]
@@ -238,8 +266,7 @@ try:
     else:
         check("임베딩 모델 100% CPU", False, "적재되어 있지 않음")
 finally:
-    gateway.terminate()
-    gateway.wait(timeout=10)
+    stop_gateway(gateway)
 
 if failures:
     print(f"\n4단계 검증 실패: {', '.join(failures)}")

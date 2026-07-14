@@ -1,20 +1,27 @@
 """1단계 검증: 확정 모델 구성이 이 하드웨어에서 성립하는지 실측으로 확인한다.
 
-확정 구성(docs/DECISIONS.md 26.07.06):
+확정 구성(docs/DECISIONS.md 26.07.08):
 - 추론(챗봇·이미지 분석): gemma4:12b-it-qat — 8k 컨텍스트 기준 100% GPU 적재
 - 검색 임베딩: snowflake-arctic-embed2 — CPU 실행 (VRAM은 추론 모델에 올인)
 
-실행 전제: Ollama 기동 상태, OLLAMA_CONTEXT_LENGTH=8192 환경변수.
+실행 전제: 채팅 Ollama(기본 11434)와 CPU 임베딩 Ollama(기본 11435)가 각각 기동된 상태,
+채팅 프로세스의 OLLAMA_CONTEXT_LENGTH=8192 환경변수.
 표준 라이브러리만 사용한다 — 프로젝트 구성(2단계) 전에도 실행 가능해야 하기 때문이다.
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
 import urllib.request
 
-OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+CHAT_OLLAMA_BASE_URL = os.environ.get(
+    "GATEWAY_OLLAMA_BASE_URL", "http://127.0.0.1:11434"
+).rstrip("/")
+EMBEDDING_OLLAMA_BASE_URL = os.environ.get(
+    "GATEWAY_EMBEDDING_OLLAMA_BASE_URL", "http://127.0.0.1:11435"
+).rstrip("/")
 CHAT_MODEL = "gemma4:12b-it-qat"
 EMBED_MODEL = "snowflake-arctic-embed2"
 SERVING_CONTEXT = 8192
@@ -34,16 +41,16 @@ def check(label: str, passed: bool, detail: str) -> None:
         failures.append(label)
 
 
-def get_ollama(path: str) -> dict:
+def get_ollama(base_url: str, path: str) -> dict:
     with urllib.request.urlopen(
-        OLLAMA_BASE_URL + path, timeout=REQUEST_TIMEOUT_SECONDS
+        base_url + path, timeout=REQUEST_TIMEOUT_SECONDS
     ) as response:
         return json.load(response)
 
 
-def post_ollama(path: str, payload: dict) -> dict:
+def post_ollama(base_url: str, path: str, payload: dict) -> dict:
     request = urllib.request.Request(
-        OLLAMA_BASE_URL + path,
+        base_url + path,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
@@ -75,6 +82,7 @@ check(
 
 # 2. 추론 모델 — 서빙 기본 설정 그대로 적재하고 생성 속도를 잰다.
 generation = post_ollama(
+    CHAT_OLLAMA_BASE_URL,
     "/api/generate",
     {
         "model": CHAT_MODEL,
@@ -90,6 +98,7 @@ check("추론 모델 생성", generation["eval_count"] > 0, f"{generation_speed:
 # 3. 임베딩 모델 — CPU로 적재(num_gpu 0)하고 차원과 단건 지연을 확인한다.
 embed_started = time.perf_counter()
 embedding = post_ollama(
+    EMBEDDING_OLLAMA_BASE_URL,
     "/api/embed",
     {
         "model": EMBED_MODEL,
@@ -105,13 +114,18 @@ check(
     f"{dimensions}차원, 단건 {embed_latency_ms:.0f}ms",
 )
 
-# 4. 동시 상주 — 두 모델의 적재 위치와 서빙 컨텍스트를 확인한다.
-resident = {}
-for model in get_ollama("/api/ps")["models"]:
-    resident[model["name"].removesuffix(":latest")] = model
+# 4. 동시 상주 — 분리된 두 프로세스에서 각 모델의 적재 위치와 서빙 컨텍스트를 확인한다.
+chat_resident = {
+    model["name"].removesuffix(":latest"): model
+    for model in get_ollama(CHAT_OLLAMA_BASE_URL, "/api/ps")["models"]
+}
+embedding_resident = {
+    model["name"].removesuffix(":latest"): model
+    for model in get_ollama(EMBEDDING_OLLAMA_BASE_URL, "/api/ps")["models"]
+}
 
-if CHAT_MODEL in resident:
-    chat_state = resident[CHAT_MODEL]
+if CHAT_MODEL in chat_resident:
+    chat_state = chat_resident[CHAT_MODEL]
     chat_context = chat_state.get("context_length", 0)
     fully_on_gpu = chat_state["size_vram"] == chat_state["size"]
     check(
@@ -123,8 +137,8 @@ if CHAT_MODEL in resident:
 else:
     check("추론 모델 100% GPU", False, "적재되어 있지 않음")
 
-if EMBED_MODEL in resident:
-    embed_state = resident[EMBED_MODEL]
+if EMBED_MODEL in embedding_resident:
+    embed_state = embedding_resident[EMBED_MODEL]
     check(
         "임베딩 모델 100% CPU",
         embed_state["size_vram"] == 0,

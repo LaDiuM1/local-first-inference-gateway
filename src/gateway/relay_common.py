@@ -71,12 +71,23 @@ def relayed_headers(response: httpx.Response, excluded: set[str]) -> dict[str, s
     }
 
 
+async def close_response(response: httpx.Response) -> None:
+    """취소된 뒤에도 업스트림 응답을 끝까지 닫는다.
+
+    취소된 스코프 안의 await는 첫 체크포인트에서 곧바로 다시 취소된다. 실제 네트워크 응답의
+    aclose()는 체크포인트를 가지므로, shield로 감싸지 않으면 기한 초과 경로에서 닫기 자체가
+    취소돼 연결이 열린 채 남는다.
+    """
+    with anyio.CancelScope(shield=True):
+        await response.aclose()
+
+
 async def read_and_close_response(response: httpx.Response) -> bytes:
-    """스트리밍 응답 본문을 버퍼링하고 성공·실패 어느 경로에서도 연결을 닫는다."""
+    """스트리밍 응답 본문을 버퍼링하고 성공·실패·기한 초과 어느 경로에서도 연결을 닫는다."""
     try:
         return await response.aread()
     finally:
-        await response.aclose()
+        await close_response(response)
 
 
 def is_fallback_status(status_code: int) -> bool:
@@ -277,6 +288,7 @@ async def secure_success_stream(response: httpx.Response) -> StreamPrefix | None
     전송 청크가 SSE 라인·이벤트를 임의로 쪼갤 수 있으므로 완결된 data 이벤트가 나올 때까지 원문
     바이트를 모은다. 유효하면 소비한 바이트와 남은 iterator를 담아 돌려주고(응답은 열린 채로 둔다),
     스트림이 끝나거나 검사 상한을 넘거나 깨진/비 SSE 내용이면 응답을 닫고 None을 돌려준다.
+    기한 초과로 검사가 취소되는 경우까지 포함해 커밋하지 못한 응답은 반드시 닫는다.
     """
     remaining = response.aiter_bytes()
     inspection = bytearray()
@@ -285,10 +297,10 @@ async def secure_success_stream(response: httpx.Response) -> StreamPrefix | None
         try:
             chunk = await anext(remaining)
         except (StopAsyncIteration, httpx.RequestError):
-            await response.aclose()
+            await close_response(response)
             return None
         except BaseException:
-            await response.aclose()
+            await close_response(response)
             raise
         if not chunk:
             continue
@@ -310,11 +322,11 @@ async def secure_success_stream(response: httpx.Response) -> StreamPrefix | None
                 remaining,
             )
         if classification.verdict is _PrefixVerdict.invalid:
-            await response.aclose()
+            await close_response(response)
             return None
         # 첫 이벤트가 상한 안에서 끝나지 않았다. 현재 transport 청크의 나머지는 복사하지 않는다.
         if inspected_length < len(chunk) or inspected_length == available:
-            await response.aclose()
+            await close_response(response)
             return None
 
 

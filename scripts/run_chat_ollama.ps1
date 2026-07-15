@@ -1,9 +1,9 @@
 ﻿<#
 .SYNOPSIS
-  CPU 전용 임베딩 Ollama를 loopback에서 실행하고 종료 시 backoff로 재기동한다.
+  범용 추론 Ollama를 loopback에서 독립 실행하고 종료 시 backoff로 재기동한다.
 #>
 param(
-    [int]$Port = 11435,
+    [int]$Port = 11434,
     [string]$OllamaPath = "",
     [string]$ModelsPath = "",
     [string[]]$ServeCommand = @(),
@@ -18,7 +18,7 @@ $ErrorActionPreference = "Stop"
 function Resolve-OllamaPath {
     if ($OllamaPath) {
         if (-not (Test-Path -LiteralPath $OllamaPath -PathType Leaf)) {
-            throw "지정한 Ollama 실행 파일이 없다."
+            throw "지정한 ollama 실행 파일이 없다."
         }
         return (Resolve-Path -LiteralPath $OllamaPath).Path
     }
@@ -35,7 +35,7 @@ function Resolve-OllamaPath {
             return $candidate
         }
     }
-    throw "Ollama 실행 파일을 찾을 수 없다."
+    throw "ollama 실행 파일을 찾을 수 없다."
 }
 
 $command = $ServeCommand
@@ -49,18 +49,19 @@ if ($ModelsPath) {
     $env:OLLAMA_MODELS = (Resolve-Path -LiteralPath $ModelsPath).Path
 }
 $env:OLLAMA_HOST = "127.0.0.1:$Port"
-$env:CUDA_VISIBLE_DEVICES = "-1"
+$env:OLLAMA_CONTEXT_LENGTH = "8192"
 $env:OLLAMA_MAX_LOADED_MODELS = "1"
 $env:OLLAMA_NUM_PARALLEL = "1"
 $env:OLLAMA_NO_CLOUD = "1"
 Remove-Item Env:OLLAMA_API_KEY -ErrorAction SilentlyContinue
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
 
 $arguments = @()
 if ($command.Count -gt 1) {
     $arguments = $command[1..($command.Count - 1)]
 }
 $supervisor = @{
-    Name              = "embedding-ollama"
+    Name              = "chat-ollama"
     Executable        = $command[0]
     ArgumentList      = $arguments
     MaxRestarts       = $MaxRestarts

@@ -8,7 +8,10 @@
 import gzip
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Protocol
 
+import anyio
 import httpx
 import pytest
 import respx
@@ -16,7 +19,8 @@ from asgi_lifespan import LifespanManager
 from pydantic import SecretStr
 
 from gateway.config import settings
-from gateway.main import app
+from gateway.embeddings import EMBEDDING_VECTOR_DIMENSIONS
+from gateway.main import create_app
 
 pytestmark = pytest.mark.anyio
 
@@ -32,6 +36,11 @@ FALLBACK_MODEL = "gpt-5-mini"
 TEST_KEY = "test-openai-key-not-real"
 
 CHAT_REQUEST = {"model": CHAT_ALIAS, "messages": [{"role": "user", "content": "안녕"}]}
+
+
+class GatewayCredentials(Protocol):
+    store_path: Path
+    api_key: str
 
 
 class TrackingStream(httpx.AsyncByteStream):
@@ -52,12 +61,39 @@ class TrackingStream(httpx.AsyncByteStream):
         self.closed = True
 
 
-async def _gateway_client() -> AsyncIterator[httpx.AsyncClient]:
+class SlowStream(httpx.AsyncByteStream):
+    """응답 헤더는 즉시 오지만 본문은 늦게 도착하는 스트림 — 상태 확정 뒤의 본문 지연을 만든다.
+
+    닫기는 실제 연결처럼 체크포인트를 지난다. 취소된 스코프 안에서 닫으면 곧바로 다시 취소되므로,
+    기한 초과 경로가 닫기를 shield로 감싸지 않으면 이 스트림은 열린 채로 남는다.
+    """
+
+    def __init__(self, body: bytes, delay: float) -> None:
+        self._body = body
+        self._delay = delay
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        await anyio.sleep(self._delay)
+        yield self._body
+
+    async def aclose(self) -> None:
+        await anyio.sleep(0)
+        self.closed = True
+
+
+async def _gateway_client(
+    credentials: GatewayCredentials,
+) -> AsyncIterator[httpx.AsyncClient]:
     # 폴백 키는 각 픽스처가 lifespan 진입 전에 주입한 뒤 여기서 인프로세스 클라이언트를 연다.
+    # 임시 키 저장소는 앱 팩터리 인자로만 준다 — 운영 앱의 저장소 자리는 설정으로 열리지 않는다.
+    app = create_app(api_key_store_path=credentials.store_path)
     async with LifespanManager(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
-            transport=transport, base_url="http://gateway.test"
+            transport=transport,
+            base_url="http://gateway.test",
+            headers={"Authorization": f"Bearer {credentials.api_key}"},
         ) as client:
             yield client
 
@@ -65,18 +101,20 @@ async def _gateway_client() -> AsyncIterator[httpx.AsyncClient]:
 @pytest.fixture
 async def fallback_client(
     monkeypatch: pytest.MonkeyPatch,
+    gateway_credentials: GatewayCredentials,
 ) -> AsyncIterator[httpx.AsyncClient]:
     monkeypatch.setattr(settings, "openai_api_key", SecretStr(TEST_KEY))
-    async for client in _gateway_client():
+    async for client in _gateway_client(gateway_credentials):
         yield client
 
 
 @pytest.fixture
 async def no_key_client(
     monkeypatch: pytest.MonkeyPatch,
+    gateway_credentials: GatewayCredentials,
 ) -> AsyncIterator[httpx.AsyncClient]:
     monkeypatch.setattr(settings, "openai_api_key", None)
-    async for client in _gateway_client():
+    async for client in _gateway_client(gateway_credentials):
         yield client
 
 
@@ -257,6 +295,30 @@ async def test_unreadable_streaming_4xx_preserves_status_without_fallback(
 
     response = await fallback_client.post(
         "/v1/chat/completions", json={**CHAT_REQUEST, "stream": True}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "upstream_response_unavailable"
+    assert not openai.called
+    assert local_stream.closed
+
+
+# 상태 코드를 받은 순간 폴백 대상 아닌 4xx는 확정된다. 그 뒤 본문이 로컬 기한을 넘겨 도착하더라도
+# 로컬이 판단한 클라이언트 오류이므로 상태를 보존해 돌려주고 OpenAI로는 넘기지 않는다.
+@pytest.mark.parametrize("streaming", [False, True], ids=["buffered", "streaming"])
+@respx.mock
+async def test_slow_4xx_body_keeps_local_decision_without_fallback(
+    fallback_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    streaming: bool,
+) -> None:
+    monkeypatch.setattr(settings, "local_response_start_timeout_seconds", 0.05)
+    local_stream = SlowStream(b'{"error":{"message":"client mistake"}}', 0.3)
+    respx.post(LOCAL_URL).mock(return_value=httpx.Response(400, stream=local_stream))
+    openai = respx.post(OPENAI_URL).respond(200, json={"id": "openai", "choices": []})
+
+    response = await fallback_client.post(
+        "/v1/chat/completions", json={**CHAT_REQUEST, "stream": streaming}
     )
 
     assert response.status_code == 400
@@ -834,7 +896,9 @@ routes:
 
 @respx.mock
 async def test_extra_chat_alias_routes_local_only_and_never_calls_openai(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: object
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    gateway_credentials: GatewayCredentials,
 ) -> None:
     routing_path = tmp_path / "routing.yaml"
     routing_path.write_text(_LOCAL_ONLY_ROUTING, encoding="utf-8")
@@ -844,7 +908,7 @@ async def test_extra_chat_alias_routes_local_only_and_never_calls_openai(
     local = respx.post(LOCAL_URL).mock(side_effect=httpx.ConnectError("down"))
     openai = respx.post(OPENAI_URL)
 
-    async for client in _gateway_client():
+    async for client in _gateway_client(gateway_credentials):
         response = await client.post(
             "/v1/chat/completions",
             json={"model": "summarize", "messages": [{"role": "user", "content": "x"}]},
@@ -884,7 +948,11 @@ async def test_embed_uses_dedicated_base_url(
     fallback_client: httpx.AsyncClient,
 ) -> None:
     embed = respx.post(EMBED_URL).respond(
-        200, json={"model": "snowflake-arctic-embed2", "embeddings": [[0.1, 0.2]]}
+        200,
+        json={
+            "model": "snowflake-arctic-embed2",
+            "embeddings": [[0.1] * EMBEDDING_VECTOR_DIMENSIONS],
+        },
     )
     other = respx.post(LOCAL_URL)
 

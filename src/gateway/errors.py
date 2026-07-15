@@ -1,10 +1,4 @@
-"""요청 검증 실패와 업스트림 오류를 OpenAI 규격 에러 응답으로 표현한다.
-
-게이트웨이가 직접 응답하는 경우 — 계약에 맞지 않는 요청의 400 거절, 로컬 업스트림 연결 실패의
-502 합성, 임베딩 업스트림의 비정상 응답을 OpenAI 형식으로 감싼 전달, 폴백 비대상 별칭의 로컬
-장애 502, 임베딩 업스트림이 유효한 응답을 못 준 502, 폴백 provider를 쓸 수 없을 때의 502.
-어느 경우에도 인증 헤더·키 같은 비밀은 담지 않는다.
-"""
+"""게이트웨이 오류를 비밀 없는 OpenAI 규격 응답으로 표현한다."""
 
 import httpx
 from fastapi.responses import JSONResponse
@@ -73,6 +67,16 @@ def fallback_unavailable_response(detail: str) -> JSONResponse:
         message=f"fallback provider unavailable: {detail}",
         error_type="upstream_error",
         code="fallback_unavailable",
+    )
+
+
+def response_start_timeout_response() -> JSONResponse:
+    """전체 응답 시작 기한 안에 유효한 결과를 확보하지 못했다."""
+    return _error_response(
+        status_code=504,
+        message="inference response did not start before the gateway deadline",
+        error_type="upstream_error",
+        code="response_start_timeout",
     )
 
 

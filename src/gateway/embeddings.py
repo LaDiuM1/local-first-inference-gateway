@@ -15,13 +15,16 @@ import math
 import struct
 from enum import StrEnum
 
+import anyio
 import httpx
 from fastapi import Response
 from fastapi.responses import JSONResponse
 
+from gateway.deadline import ResponseStartDeadline
 from gateway.errors import (
     InvalidRequestError,
     invalid_request_response,
+    response_start_timeout_response,
     upstream_invalid_response,
     upstream_unavailable_response,
 )
@@ -30,6 +33,8 @@ from gateway.validation import load_json_object, load_standard_json, require_str
 
 NATIVE_EMBED_PATH = "/api/embed"
 CPU_ONLY_OPTIONS = {"num_gpu": 0}
+# 공개 `embed` 계약과 기존 색인의 벡터 차원.
+EMBEDDING_VECTOR_DIMENSIONS = 1024
 
 
 class EncodingFormat(StrEnum):
@@ -40,7 +45,10 @@ class EncodingFormat(StrEnum):
 
 
 async def create_embeddings(
-    embedding_client: httpx.AsyncClient, routing: RoutingTable, body: bytes
+    embedding_client: httpx.AsyncClient,
+    routing: RoutingTable,
+    body: bytes,
+    deadline: ResponseStartDeadline,
 ) -> Response:
     """입력을 검증하고 별칭을 실제 모델로 치환한 뒤 native /api/embed로 CPU 임베딩을 요청한다."""
     try:
@@ -57,10 +65,16 @@ async def create_embeddings(
         "input": embedding_input,
         "options": CPU_ONLY_OPTIONS,
     }
+    timeout_seconds = deadline.local_remaining_seconds()
+    if timeout_seconds <= 0:
+        return response_start_timeout_response()
     try:
-        upstream_response = await embedding_client.post(
-            NATIVE_EMBED_PATH, json=native_request
-        )
+        with anyio.fail_after(timeout_seconds):
+            upstream_response = await embedding_client.post(
+                NATIVE_EMBED_PATH, json=native_request
+            )
+    except TimeoutError:
+        return response_start_timeout_response()
     except httpx.RequestError as error:
         return upstream_unavailable_response(error)
 
@@ -69,8 +83,8 @@ async def create_embeddings(
     if upstream_response.status_code != 200:
         return _upstream_error_response(upstream_response)
 
-    # 200이어도 본문이 유효한 임베딩 응답임을 확인한 뒤에 변환한다 — 파싱 실패나 벡터 개수·형식
-    # 불일치는 빈 성공 목록이나 500이 아니라 비밀 없는 OpenAI 규격 502로 돌려준다.
+    # 200이어도 본문이 유효한 임베딩 응답임을 확인한 뒤에 변환한다 — 파싱 실패나 벡터 개수·차원·
+    # 형식 불일치는 빈 성공 목록이나 500이 아니라 비밀 없는 OpenAI 규격 502로 돌려준다.
     expected_count = _expected_vector_count(embedding_input)
     try:
         native_body = load_standard_json(upstream_response.content)
@@ -101,15 +115,7 @@ def _is_valid_embedding_body(
         native_body["prompt_eval_count"]
     ):
         return False
-    dimensions: int | None = None
-    for vector in vectors:
-        if not _is_valid_vector(vector):
-            return False
-        if dimensions is None:
-            dimensions = len(vector)
-        elif len(vector) != dimensions:
-            return False
-    return True
+    return all(_is_valid_vector(vector) for vector in vectors)
 
 
 def _is_valid_prompt_eval_count(value: object) -> bool:
@@ -117,7 +123,7 @@ def _is_valid_prompt_eval_count(value: object) -> bool:
 
 
 def _is_valid_vector(vector: object) -> bool:
-    if not isinstance(vector, list) or not vector:
+    if not isinstance(vector, list) or len(vector) != EMBEDDING_VECTOR_DIMENSIONS:
         return False
     return all(_is_valid_embedding_value(value) for value in vector)
 

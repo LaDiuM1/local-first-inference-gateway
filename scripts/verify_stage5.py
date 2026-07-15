@@ -31,6 +31,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from verification_auth import UVICORN_APPLICATION_ARGUMENTS, VerificationAuth
 
 # 한국어 기본 콘솔(cp949)에서도 인코딩 불가 글리프로 죽지 않도록 출력 오류를 안전하게 대체한다.
 # 라벨·메시지는 ASCII와 cp949로 표현 가능한 한글만 쓰지만, 안전장치로 대체 처리를 켜 둔다.
@@ -56,6 +57,8 @@ FAKE_BASE_URL = f"http://{FAKE_HOST}:{FAKE_PORT}"
 FAKE_KEY = "sk-fake-verify-key-not-real"
 FALLBACK_MODEL = "gpt-5-mini"
 OPEN_SECONDS = 1.0
+# embed 외부 계약 차원 — 게이트웨이는 이 차원의 벡터만 클라이언트에 전달한다.
+EMBED_DIMENSIONS = 1024
 FAILURE_THRESHOLD = 3
 STARTUP_TIMEOUT_SECONDS = 15
 REQUEST_TIMEOUT_SECONDS = 30
@@ -66,6 +69,7 @@ CONTROL = {"chat": "ok", "openai": "ok", "embed": "ok"}
 STATS = {"local": 0, "openai": 0, "embed": 0, "last_openai_body": None}
 
 failures: list[str] = []
+AUTH = VerificationAuth.create("stage5-verifier")
 
 
 def check(label: str, passed: bool, detail: str) -> None:
@@ -150,7 +154,7 @@ async def fake_embed(request: Request) -> object:
     return JSONResponse(
         {
             "model": "snowflake-arctic-embed2",
-            "embeddings": [[0.1, 0.2, 0.3]],
+            "embeddings": [[0.1] * EMBED_DIMENSIONS],
             "prompt_eval_count": 3,
         }
     )
@@ -181,12 +185,13 @@ def start_gateway() -> subprocess.Popen:
         "GATEWAY_CIRCUIT_BREAKER_OPEN_SECONDS": str(OPEN_SECONDS),
         "OPENAI_API_KEY": FAKE_KEY,
     }
+    AUTH.apply_to(env)
     process = subprocess.Popen(
         [
             sys.executable,
             "-m",
             "uvicorn",
-            "gateway.main:app",
+            *UVICORN_APPLICATION_ARGUMENTS,
             "--host",
             GATEWAY_HOST,
             "--port",
@@ -206,7 +211,7 @@ def start_gateway() -> subprocess.Popen:
                 f"게이트웨이 프로세스가 기동 중 종료했다 (exit {process.returncode})"
             )
         try:
-            health = httpx.get(f"{GATEWAY_BASE_URL}/health")
+            health = httpx.get(f"{GATEWAY_BASE_URL}/health", headers=AUTH.headers)
             if health.json() == {"status": "ok"}:
                 return process
         except httpx.TransportError:
@@ -257,7 +262,7 @@ def read_aborted_stream(
 fake_server = start_fake_server()
 gateway = start_gateway()
 try:
-    client = httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS)
+    client = httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS, headers=AUTH.headers)
 
     # 1. 로컬 성공 — OpenAI를 호출하지 않는다.
     reset_chat_breaker(client)
@@ -415,9 +420,10 @@ try:
     check(
         "embed 정상 응답(별도 주소)",
         response.status_code == 200
-        and len(response.json()["data"][0]["embedding"]) == 3
+        and len(response.json()["data"][0]["embedding"]) == EMBED_DIMENSIONS
         and STATS["embed"] == embed_before + 1,
-        f"status={response.status_code}, 임베딩 호출 {STATS['embed'] - embed_before}건",
+        f"status={response.status_code}, {len(response.json()['data'][0]['embedding'])}차원, "
+        f"임베딩 호출 {STATS['embed'] - embed_before}건",
     )
 
     # 11. embed 무결성 — 200이지만 벡터 개수가 맞지 않으면 우회 없이 OpenAI 규격 502로 합성한다.
@@ -440,6 +446,7 @@ finally:
     gateway.terminate()
     gateway.wait(timeout=10)
     fake_server.should_exit = True
+    AUTH.close()
 
 if failures:
     print(f"\n5단계 검증 실패: {', '.join(failures)}")

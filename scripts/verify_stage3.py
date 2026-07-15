@@ -8,21 +8,36 @@
 실행: uv run python scripts/verify_stage3.py
 """
 
+import os
+import socket
 import subprocess
 import sys
 import time
 
 import httpx
 import openai
+from verification_auth import UVICORN_APPLICATION_ARGUMENTS, VerificationAuth
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="backslashreplace")
 
 GATEWAY_HOST = "127.0.0.1"
-GATEWAY_PORT = 8000
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((GATEWAY_HOST, 0))
+        return probe.getsockname()[1]
+
+
+GATEWAY_PORT = free_port()
 GATEWAY_BASE_URL = f"http://{GATEWAY_HOST}:{GATEWAY_PORT}"
 CHAT_ALIAS = "chat"
 STARTUP_TIMEOUT_SECONDS = 15
 REQUEST_TIMEOUT_SECONDS = 180
 
 failures: list[str] = []
+AUTH = VerificationAuth.create("stage3-verifier")
 
 
 def check(label: str, passed: bool, detail: str) -> None:
@@ -35,24 +50,27 @@ def check(label: str, passed: bool, detail: str) -> None:
 
 
 def start_gateway() -> subprocess.Popen:
+    environment = os.environ.copy()
+    AUTH.apply_to(environment)
     process = subprocess.Popen(
         [
             sys.executable,
             "-m",
             "uvicorn",
-            "gateway.main:app",
+            *UVICORN_APPLICATION_ARGUMENTS,
             "--host",
             GATEWAY_HOST,
             "--port",
             str(GATEWAY_PORT),
             "--log-level",
             "warning",
-        ]
+        ],
+        env=environment,
     )
     deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         try:
-            health = httpx.get(f"{GATEWAY_BASE_URL}/health")
+            health = httpx.get(f"{GATEWAY_BASE_URL}/health", headers=AUTH.headers)
             if health.json() == {"status": "ok"}:
                 return process
         except httpx.TransportError:
@@ -66,7 +84,7 @@ try:
     # 1. SSE 순차 수신 — 델타 수신 시각이 시간축에 분산되는지 측정한다.
     client = openai.OpenAI(
         base_url=f"{GATEWAY_BASE_URL}/v1",
-        api_key="unused",
+        api_key=AUTH.api_key,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
 
@@ -114,7 +132,7 @@ try:
     broken = httpx.post(
         f"{GATEWAY_BASE_URL}/v1/chat/completions",
         content=b'{"model": broken',
-        headers={"content-type": "application/json"},
+        headers={**AUTH.headers, "content-type": "application/json"},
     )
     check(
         "깨진 JSON 게이트웨이 400 거절",
@@ -125,6 +143,7 @@ try:
 finally:
     gateway.terminate()
     gateway.wait(timeout=10)
+    AUTH.close()
 
 if failures:
     print(f"\n3단계 검증 실패: {', '.join(failures)}")

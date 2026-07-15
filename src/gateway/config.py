@@ -2,6 +2,8 @@
 
 OpenAI 폴백 키만 예외로 표준 `OPENAI_API_KEY`에서 읽고 `SecretStr`로 다뤄 노출을 막는다.
 키가 없어도 로컬 정상 요청과 앱 기동은 되며, 실제 폴백이 필요할 때만 비밀 없는 502로 응답한다.
+
+인증 저장소와 공개 문서처럼 배포 경계에 속하는 경로는 `gateway.paths`에 고정한다.
 """
 
 from pathlib import Path
@@ -22,6 +24,8 @@ class Settings(BaseSettings):
     embedding_ollama_base_url: str = "http://127.0.0.1:11435"
     upstream_connect_timeout_seconds: float = 5.0
     upstream_read_timeout_seconds: float = 120.0
+    local_response_start_timeout_seconds: float = Field(default=90.0, gt=0)
+    total_response_start_timeout_seconds: float = Field(default=115.0, gt=0)
     routing_config_path: Path = Path("routing.yaml")
 
     # 별칭별 회로 차단기 — 연속 실패가 임계값에 닿으면 open_seconds 동안 로컬을 건너뛴다.

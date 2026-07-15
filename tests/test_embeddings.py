@@ -9,6 +9,7 @@ import pytest
 import respx
 
 from gateway.config import settings
+from gateway.embeddings import EMBEDDING_VECTOR_DIMENSIONS
 
 pytestmark = pytest.mark.anyio
 
@@ -19,6 +20,14 @@ EMBED_ALIAS = "embed"
 EMBED_MODEL = "snowflake-arctic-embed2"
 
 
+def _vector(start: float = 0.0) -> list[float]:
+    """계약 차원(1024)을 채운 벡터 — 성분마다 값이 달라 순서 보존도 함께 확인한다."""
+    return [
+        round(start + index / EMBEDDING_VECTOR_DIMENSIONS, 6)
+        for index in range(EMBEDDING_VECTOR_DIMENSIONS)
+    ]
+
+
 def _native_response(vectors: list[list[float]], prompt_tokens: int = 3) -> dict:
     return {
         "model": EMBED_MODEL,
@@ -27,16 +36,36 @@ def _native_response(vectors: list[list[float]], prompt_tokens: int = 3) -> dict
     }
 
 
+def _native_body_with_value(raw_value: bytes) -> bytes:
+    """마지막 성분만 raw_value로 바꾼 계약 차원 벡터 하나짜리 native 응답 바이트.
+
+    차원은 계약대로 맞춰 값 검증만 남긴다 — 짧은 벡터로 만들면 차원 검사에서 먼저 걸려 값 검증이
+    실행되지 않는다.
+    """
+    components = [b"0.1"] * (EMBEDDING_VECTOR_DIMENSIONS - 1) + [raw_value]
+    return (
+        b'{"model":"snowflake-arctic-embed2","embeddings":[['
+        + b",".join(components)
+        + b"]]}"
+    )
+
+
 def _decode_base64(encoded: str, dimensions: int) -> list[float]:
     # OpenAI SDK와 동일한 방식으로 base64를 float32 리틀엔디언 벡터로 되돌린다.
     return list(struct.unpack(f"<{dimensions}f", base64.b64decode(encoded)))
+
+
+def test_embed_external_contract_dimension_is_1024() -> None:
+    # 공개 연동 가이드(docs/API.md)가 클라이언트에 공표한 값 — 바뀌면 기존 색인과 벡터 공간이 깨진다.
+    assert EMBEDDING_VECTOR_DIMENSIONS == 1024
 
 
 @respx.mock
 async def test_embed_single_string_converts_to_openai_format(
     gateway_client: httpx.AsyncClient,
 ) -> None:
-    route = respx.post(UPSTREAM_URL).respond(200, json=_native_response([[0.1, 0.2]]))
+    vector = _vector()
+    route = respx.post(UPSTREAM_URL).respond(200, json=_native_response([vector]))
 
     response = await gateway_client.post(
         "/v1/embeddings", json={"model": EMBED_ALIAS, "input": "상품 설명"}
@@ -46,9 +75,7 @@ async def test_embed_single_string_converts_to_openai_format(
     body = response.json()
     assert body["object"] == "list"
     assert body["model"] == EMBED_MODEL
-    assert body["data"] == [
-        {"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}
-    ]
+    assert body["data"] == [{"object": "embedding", "index": 0, "embedding": vector}]
     assert body["usage"] == {"prompt_tokens": 3, "total_tokens": 3}
 
     native_request = json.loads(route.calls.last.request.content)
@@ -61,7 +88,7 @@ async def test_embed_single_string_converts_to_openai_format(
 async def test_embed_array_preserves_order_and_index(
     gateway_client: httpx.AsyncClient,
 ) -> None:
-    vectors = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
+    vectors = [_vector(0.1), _vector(0.3), _vector(0.5)]
     route = respx.post(UPSTREAM_URL).respond(200, json=_native_response(vectors))
 
     response = await gateway_client.post(
@@ -82,7 +109,7 @@ async def test_embed_array_preserves_order_and_index(
 async def test_embed_forwards_cpu_only_option(
     gateway_client: httpx.AsyncClient,
 ) -> None:
-    route = respx.post(UPSTREAM_URL).respond(200, json=_native_response([[0.1]]))
+    route = respx.post(UPSTREAM_URL).respond(200, json=_native_response([_vector()]))
 
     await gateway_client.post(
         "/v1/embeddings", json={"model": EMBED_ALIAS, "input": "x"}
@@ -96,14 +123,15 @@ async def test_embed_forwards_cpu_only_option(
 async def test_embed_explicit_float_returns_float_list(
     gateway_client: httpx.AsyncClient,
 ) -> None:
-    route = respx.post(UPSTREAM_URL).respond(200, json=_native_response([[0.1, 0.2]]))
+    vector = _vector()
+    route = respx.post(UPSTREAM_URL).respond(200, json=_native_response([vector]))
 
     response = await gateway_client.post(
         "/v1/embeddings",
         json={"model": EMBED_ALIAS, "input": "x", "encoding_format": "float"},
     )
 
-    assert response.json()["data"][0]["embedding"] == [0.1, 0.2]
+    assert response.json()["data"][0]["embedding"] == vector
     native_request = json.loads(route.calls.last.request.content)
     assert "encoding_format" not in native_request
     assert native_request["options"] == {"num_gpu": 0}
@@ -113,7 +141,7 @@ async def test_embed_explicit_float_returns_float_list(
 async def test_embed_base64_returns_decodable_float32(
     gateway_client: httpx.AsyncClient,
 ) -> None:
-    vector = [0.1, 0.2, 0.3]
+    vector = _vector()
     respx.post(UPSTREAM_URL).respond(200, json=_native_response([vector]))
 
     response = await gateway_client.post(
@@ -130,7 +158,7 @@ async def test_embed_base64_returns_decodable_float32(
 async def test_embed_base64_array_preserves_order_and_cpu_option(
     gateway_client: httpx.AsyncClient,
 ) -> None:
-    vectors = [[0.1, 0.2], [0.3, 0.4]]
+    vectors = [_vector(0.1), _vector(0.3)]
     route = respx.post(UPSTREAM_URL).respond(200, json=_native_response(vectors))
 
     response = await gateway_client.post(
@@ -231,11 +259,7 @@ async def test_embed_non_200_success_status_becomes_502_without_openai(
         b'{"model":"snowflake-arctic-embed2","embeddings":"nope"}',
         b'{"model":"snowflake-arctic-embed2","embeddings":[]}',
         b'{"model":"snowflake-arctic-embed2","embeddings":[[]]}',
-        b'{"model":"snowflake-arctic-embed2","embeddings":[["a","b"]]}',
-        b'{"model":"snowflake-arctic-embed2","embeddings":[[true,false]]}',
-        b'{"model":"snowflake-arctic-embed2","embeddings":[[NaN]]}',
-        b'{"model":"snowflake-arctic-embed2","embeddings":[[Infinity]]}',
-        b'{"model":"snowflake-arctic-embed2","embeddings":[[1e400]]}',
+        b'{"model":"snowflake-arctic-embed2","embeddings":[0.1]}',
     ],
     ids=[
         "invalid-json",
@@ -245,11 +269,7 @@ async def test_embed_non_200_success_status_becomes_502_without_openai(
         "embeddings-not-list",
         "wrong-count",
         "empty-vector",
-        "non-numeric-vector",
-        "boolean-vector",
-        "nan-vector",
-        "infinity-vector",
-        "overflow-number",
+        "vector-not-list",
     ],
 )
 @respx.mock
@@ -303,8 +323,9 @@ async def test_embed_invalid_upstream_200_returns_openai_shaped_502(
 async def test_embed_invalid_prompt_eval_count_returns_502_without_openai(
     gateway_client: httpx.AsyncClient, prompt_eval_count: bytes
 ) -> None:
+    vector = json.dumps(_vector()).encode()
     body = (
-        b'{"model":"snowflake-arctic-embed2","embeddings":[[0.1]],'
+        b'{"model":"snowflake-arctic-embed2","embeddings":[' + vector + b"],"
         b'"prompt_eval_count":' + prompt_eval_count + b"}"
     )
     respx.post(UPSTREAM_URL).respond(
@@ -326,7 +347,7 @@ async def test_embed_vector_count_mismatch_returns_openai_shaped_502(
     gateway_client: httpx.AsyncClient,
 ) -> None:
     # 입력 2개인데 벡터 1개 — 개수 불일치는 검색 정합성을 깨는 무효 응답이다.
-    respx.post(UPSTREAM_URL).respond(200, json=_native_response([[0.1, 0.2]]))
+    respx.post(UPSTREAM_URL).respond(200, json=_native_response([_vector()]))
 
     response = await gateway_client.post(
         "/v1/embeddings", json={"model": EMBED_ALIAS, "input": ["a", "b"]}
@@ -336,11 +357,38 @@ async def test_embed_vector_count_mismatch_returns_openai_shaped_502(
     assert response.json()["error"]["code"] == "upstream_invalid_response"
 
 
+# 벡터 차원은 `embed` 외부 계약이다. 기존 색인과 벡터 공간을 공유하지 못하는 응답은 벡터끼리
+# 차원이 같더라도 변환하지 않는다 — float·base64 어느 형식으로도 직렬화하기 전에 502로 끊는다.
+@pytest.mark.parametrize("encoding_format", ["float", "base64"])
+@pytest.mark.parametrize(
+    "dimensions",
+    [EMBEDDING_VECTOR_DIMENSIONS - 1, EMBEDDING_VECTOR_DIMENSIONS + 1],
+    ids=["one-short", "one-long"],
+)
 @respx.mock
-async def test_embed_mixed_vector_dimensions_return_502_without_openai(
+async def test_embed_wrong_vector_dimensions_return_502_without_openai(
+    gateway_client: httpx.AsyncClient, dimensions: int, encoding_format: str
+) -> None:
+    respx.post(UPSTREAM_URL).respond(200, json=_native_response([[0.1] * dimensions]))
+    openai = respx.post(OPENAI_URL)
+
+    response = await gateway_client.post(
+        "/v1/embeddings",
+        json={"model": EMBED_ALIAS, "input": "x", "encoding_format": encoding_format},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_invalid_response"
+    assert not openai.called
+
+
+@respx.mock
+async def test_embed_batch_with_consistently_wrong_dimensions_returns_502(
     gateway_client: httpx.AsyncClient,
 ) -> None:
-    respx.post(UPSTREAM_URL).respond(200, json=_native_response([[0.1, 0.2], [0.3]]))
+    # 벡터끼리 차원이 같아도 계약 차원이 아니면 통과시키지 않는다.
+    wrong = [0.1] * (EMBEDDING_VECTOR_DIMENSIONS // 2)
+    respx.post(UPSTREAM_URL).respond(200, json=_native_response([wrong, wrong]))
     openai = respx.post(OPENAI_URL)
 
     response = await gateway_client.post(
@@ -352,45 +400,62 @@ async def test_embed_mixed_vector_dimensions_return_502_without_openai(
     assert not openai.called
 
 
-# float32로 인코딩할 수 없는 값 — float64로는 유한한 큰 수(1e39)나 float 변환이 넘치는 큰 정수는
-# 처리되지 않은 500이 아니라 비밀 없는 OpenAI 규격 502로 반환해야 한다. float·base64 요청 모두 동일하다.
-_HUGE_INT_BODY = (
-    b'{"model":"snowflake-arctic-embed2","embeddings": [[' + b"1" + b"0" * 400 + b"]]}"
-)
-
-
-@pytest.mark.parametrize(
-    ("encoding_format", "native_body_bytes"),
-    [
-        (
-            "float",
-            b'{"model":"snowflake-arctic-embed2","embeddings":[[1e39]]}',
-        ),
-        (
-            "base64",
-            b'{"model":"snowflake-arctic-embed2","embeddings":[[1e39]]}',
-        ),
-        ("float", _HUGE_INT_BODY),
-        ("base64", _HUGE_INT_BODY),
-    ],
-    ids=[
-        "float32-overflow-float",
-        "float32-overflow-base64",
-        "huge-int-float",
-        "huge-int-base64",
-    ],
-)
 @respx.mock
-async def test_embed_out_of_float32_range_returns_openai_shaped_502(
+async def test_embed_mixed_vector_dimensions_return_502_without_openai(
     gateway_client: httpx.AsyncClient,
-    encoding_format: str,
-    native_body_bytes: bytes,
 ) -> None:
     respx.post(UPSTREAM_URL).respond(
         200,
-        content=native_body_bytes,
+        json=_native_response([_vector(), [0.3] * (EMBEDDING_VECTOR_DIMENSIONS - 1)]),
+    )
+    openai = respx.post(OPENAI_URL)
+
+    response = await gateway_client.post(
+        "/v1/embeddings", json={"model": EMBED_ALIAS, "input": ["a", "b"]}
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_invalid_response"
+    assert not openai.called
+
+
+# 계약 차원을 채웠어도 성분 하나가 유효한 임베딩 값이 아니면 무효다 — 비수치·부울·비유한 수는 물론
+# float32로 인코딩할 수 없는 큰 수(1e39)나 float 변환이 넘치는 큰 정수도 처리되지 않은 500이 아니라
+# 비밀 없는 OpenAI 규격 502로 반환해야 한다. float·base64 요청 모두 직렬화 전에 같은 검증을 거친다.
+@pytest.mark.parametrize("encoding_format", ["float", "base64"])
+@pytest.mark.parametrize(
+    "raw_value",
+    [
+        b'"a"',
+        b"true",
+        b"NaN",
+        b"Infinity",
+        b"-Infinity",
+        b"1e400",
+        b"1e39",
+        b"1" + b"0" * 400,
+    ],
+    ids=[
+        "string",
+        "boolean",
+        "nan",
+        "infinity",
+        "negative-infinity",
+        "overflow-number",
+        "float32-overflow",
+        "huge-int",
+    ],
+)
+@respx.mock
+async def test_embed_invalid_vector_value_returns_502_before_encoding(
+    gateway_client: httpx.AsyncClient, raw_value: bytes, encoding_format: str
+) -> None:
+    respx.post(UPSTREAM_URL).respond(
+        200,
+        content=_native_body_with_value(raw_value),
         headers={"content-type": "application/json"},
     )
+    openai = respx.post(OPENAI_URL)
 
     response = await gateway_client.post(
         "/v1/embeddings",
@@ -399,6 +464,7 @@ async def test_embed_out_of_float32_range_returns_openai_shaped_502(
 
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "upstream_invalid_response"
+    assert not openai.called
 
 
 @pytest.mark.parametrize(

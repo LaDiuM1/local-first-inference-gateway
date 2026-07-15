@@ -9,11 +9,15 @@ API 키가 없거나 OpenAI 연결이 실패하거나 2xx인데 유효한 Chat C
 
 import json
 
+import anyio
 import httpx
 from fastapi import Response
 from pydantic import SecretStr
 
-from gateway.errors import fallback_unavailable_response
+from gateway.errors import (
+    fallback_unavailable_response,
+    response_start_timeout_response,
+)
 from gateway.relay_common import (
     EXCLUDED_BUFFERED_HEADERS,
     EXCLUDED_STREAMING_HEADERS,
@@ -46,16 +50,21 @@ class OpenAIFallback:
         self._client = client
         self._api_key = api_key
 
-    async def relay_buffered(self, routed_payload: dict) -> Response:
+    async def relay_buffered(
+        self, routed_payload: dict, response_start_timeout_seconds: float
+    ) -> Response:
         headers = self._auth_headers()
         if headers is None:
             return fallback_unavailable_response("API key is not configured")
         try:
-            response = await self._client.post(
-                OPENAI_CHAT_COMPLETIONS_PATH,
-                content=self._openai_body(routed_payload),
-                headers=headers,
-            )
+            with anyio.fail_after(response_start_timeout_seconds):
+                response = await self._client.post(
+                    OPENAI_CHAT_COMPLETIONS_PATH,
+                    content=self._openai_body(routed_payload),
+                    headers=headers,
+                )
+        except TimeoutError:
+            return response_start_timeout_response()
         except httpx.RequestError as error:
             return fallback_unavailable_response(
                 f"connection failed: {type(error).__name__}"
@@ -72,7 +81,9 @@ class OpenAIFallback:
             headers=relayed_headers(response, EXCLUDED_BUFFERED_HEADERS),
         )
 
-    async def relay_stream(self, routed_payload: dict) -> Response:
+    async def relay_stream(
+        self, routed_payload: dict, response_start_timeout_seconds: float
+    ) -> Response:
         headers = self._auth_headers()
         if headers is None:
             return fallback_unavailable_response("API key is not configured")
@@ -83,12 +94,17 @@ class OpenAIFallback:
             headers=headers,
         )
         try:
-            response = await self._client.send(request, stream=True)
+            with anyio.fail_after(response_start_timeout_seconds):
+                response = await self._client.send(request, stream=True)
+                return await self._prepare_stream_response(response)
+        except TimeoutError:
+            return response_start_timeout_response()
         except httpx.RequestError as error:
             return fallback_unavailable_response(
                 f"connection failed: {type(error).__name__}"
             )
 
+    async def _prepare_stream_response(self, response: httpx.Response) -> Response:
         if not is_success_status(response.status_code):
             # 오류 상태 — 본문을 읽어 그대로 전달한다(버퍼 경로와 같은 규칙).
             try:

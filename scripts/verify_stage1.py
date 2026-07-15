@@ -16,6 +16,9 @@ import sys
 import time
 import urllib.request
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="backslashreplace")
+
 CHAT_OLLAMA_BASE_URL = os.environ.get(
     "GATEWAY_OLLAMA_BASE_URL", "http://127.0.0.1:11434"
 ).rstrip("/")

@@ -32,6 +32,14 @@ from gateway.errors import (
     upstream_invalid_response,
     upstream_unavailable_response,
 )
+from gateway.observability import (
+    observe_alias,
+    observe_local_failure,
+    observe_provider,
+    observe_response_start,
+    observe_stream,
+    observe_upstream_start,
+)
 from gateway.routing import EndpointKind, RoutingTable
 from gateway.validation import load_json_object, load_standard_json, require_string
 
@@ -75,6 +83,8 @@ async def create_embeddings(
     except InvalidRequestError as error:
         return invalid_request_response(error.message)
 
+    observe_alias(requested_model)
+    observe_stream(streaming=False)
     native_request = {
         "model": model,
         "input": embedding_input,
@@ -82,20 +92,27 @@ async def create_embeddings(
     }
     timeout_seconds = deadline.local_remaining_seconds()
     if timeout_seconds <= 0:
+        observe_local_failure("local_deadline")
         return response_start_timeout_response()
+    observe_upstream_start()
     try:
         with anyio.fail_after(timeout_seconds):
             upstream_response = await embedding_client.post(
                 NATIVE_EMBED_PATH, json=native_request
             )
     except TimeoutError:
+        observe_local_failure("local_deadline")
         return response_start_timeout_response()
     except httpx.RequestError as error:
+        observe_local_failure("local_unreachable")
         return upstream_unavailable_response(error)
 
     if 200 < upstream_response.status_code < 300:
+        observe_local_failure("local_invalid_body")
         return upstream_invalid_response("embedding")
     if upstream_response.status_code != 200:
+        observe_provider("local")
+        observe_response_start()
         return _upstream_error_response(upstream_response)
 
     # 200이어도 본문이 유효한 임베딩 응답임을 확인한 뒤에 변환한다 — 파싱 실패나 벡터 개수·차원·
@@ -104,9 +121,13 @@ async def create_embeddings(
     try:
         native_body = load_standard_json(upstream_response.content)
     except ValueError:
+        observe_local_failure("local_invalid_body")
         return upstream_invalid_response("embedding")
     if not _is_valid_embedding_body(native_body, expected_count, model):
+        observe_local_failure("local_invalid_body")
         return upstream_invalid_response("embedding")
+    observe_provider("local")
+    observe_response_start()
     return _openai_embeddings_response(
         native_body, requested_model, encoding_format, target_dimensions
     )

@@ -29,6 +29,7 @@ from gateway.errors import (
     invalid_request_response,
     upstream_invalid_response,
 )
+from gateway.observability import observe_alias
 from gateway.openai_fallback import OpenAIFallback
 from gateway.relay import relay_chat_completions
 from gateway.relay_common import is_success_status
@@ -74,6 +75,8 @@ async def create_response(
     except InvalidRequestError as error:
         return invalid_request_response(error.message)
 
+    # 관측에는 공개 별칭을 남긴다 — 중계가 기록하는 내부 정규화 별칭(vision)이 덮지 않는다.
+    observe_alias(RESPONSES_MODEL_ALIAS)
     chat_body = json.dumps(
         {"model": VISION_ALIAS, "messages": messages, "stream": False},
         allow_nan=False,

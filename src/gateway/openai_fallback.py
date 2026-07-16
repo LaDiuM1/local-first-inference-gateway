@@ -18,6 +18,11 @@ from gateway.errors import (
     fallback_unavailable_response,
     response_start_timeout_response,
 )
+from gateway.observability import (
+    observe_provider,
+    observe_response_start,
+    observe_upstream_start,
+)
 from gateway.relay_common import (
     EXCLUDED_BUFFERED_HEADERS,
     EXCLUDED_STREAMING_HEADERS,
@@ -60,6 +65,7 @@ class OpenAIFallback:
         headers = self._auth_headers()
         if headers is None:
             return fallback_unavailable_response("API key is not configured")
+        observe_upstream_start()
         try:
             with anyio.fail_after(response_start_timeout_seconds):
                 response = await self._client.post(
@@ -79,6 +85,8 @@ class OpenAIFallback:
             response.content
         ):
             return fallback_unavailable_response(_INVALID_RESPONSE_DETAIL)
+        observe_provider("openai")
+        observe_response_start()
         return Response(
             content=response.content,
             status_code=response.status_code,
@@ -97,6 +105,7 @@ class OpenAIFallback:
             content=self._openai_body(routed_payload),
             headers=headers,
         )
+        observe_upstream_start()
         try:
             with anyio.fail_after(response_start_timeout_seconds):
                 response = await self._client.send(request, stream=True)
@@ -117,6 +126,8 @@ class OpenAIFallback:
                 return fallback_unavailable_response(
                     f"response body read failed: {type(error).__name__}"
                 )
+            observe_provider("openai")
+            observe_response_start()
             return Response(
                 content=body,
                 status_code=response.status_code,
@@ -128,6 +139,8 @@ class OpenAIFallback:
             # 첫 유효 이벤트를 못 확보한 2xx 스트림 — 시작하지 않고 비밀 없는 502로 합성한다.
             return fallback_unavailable_response(_INVALID_RESPONSE_DETAIL)
         cleanup = StreamCleanup(prefix.response)
+        observe_provider("openai")
+        observe_response_start()
         return ManagedStreamingResponse(
             iter_committed_stream(prefix, cleanup),
             cleanup,

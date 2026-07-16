@@ -73,6 +73,22 @@ def fallback_unavailable_response(detail: str) -> JSONResponse:
     )
 
 
+def internal_server_error_response() -> JSONResponse:
+    """처리되지 않은 게이트웨이 예외 — 비밀 없는 OpenAI 규격 500으로 응답한다.
+
+    관측 미들웨어가 오류 처리기 안쪽 예외를 응답 시작 전에 직접 보낼 때 사용한다.
+    Cache-Control 미들웨어를 거치지 않는 경로라 no-store를 응답이 직접 싣는다.
+    """
+    response = _error_response(
+        status_code=500,
+        message="internal server error",
+        error_type="server_error",
+        code="internal_error",
+    )
+    response.headers["cache-control"] = "no-store"
+    return response
+
+
 def response_start_timeout_response() -> JSONResponse:
     """전체 응답 시작 기한 안에 유효한 결과를 확보하지 못했다."""
     return _error_response(

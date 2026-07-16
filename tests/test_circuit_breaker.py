@@ -202,3 +202,19 @@ def test_concurrent_closed_attempts_share_generation() -> None:
         assert attempt.decision is LocalDecision.attempt
         breaker.record_failure(attempt)
     assert breaker.begin().decision is LocalDecision.attempt
+
+
+def test_transition_listener_receives_full_recovery_sequence() -> None:
+    clock = FakeClock()
+    transitions: list[str] = []
+    breaker = CircuitBreaker(
+        FAILURE_THRESHOLD, OPEN_SECONDS, clock, on_transition=transitions.append
+    )
+
+    _drive_to_open(breaker)
+    clock.advance(OPEN_SECONDS)
+    probe = breaker.begin()
+    assert probe.decision is LocalDecision.probe
+    breaker.record_success(probe)
+
+    assert transitions == ["open", "half_open", "closed"]

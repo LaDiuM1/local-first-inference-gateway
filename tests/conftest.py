@@ -10,12 +10,19 @@ from asgi_lifespan import LifespanManager
 from fastapi import FastAPI
 
 from gateway.api_keys import ApiKeyStore
+from gateway.config import settings
 from gateway.main import create_app
 
 
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture(autouse=True)
+def isolated_request_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """요청 관측 로그를 테스트 임시 경로로 격리한다 — 운영 로그 디렉터리를 건드리지 않는다."""
+    monkeypatch.setattr(settings, "request_log_directory", tmp_path / "request-logs")
 
 
 @dataclass(frozen=True)

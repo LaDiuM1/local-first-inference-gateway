@@ -316,6 +316,7 @@ def test_public_docs_markdown_is_single_secret_free_contract_source() -> None:
         "115초",
         "OpenAI 형식",
         "stream: true",
+        "x-request-id",
     ]:
         assert required in source
     for forbidden in ["127.0.0.1", "11434", "11435", "ProgramData", "C:\\"]:

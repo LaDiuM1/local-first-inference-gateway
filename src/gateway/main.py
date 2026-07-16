@@ -25,6 +25,7 @@ from gateway.openai_fallback import OpenAIFallback
 from gateway.paths import API_KEY_STORE_PATH, PUBLIC_DOCS_PATH
 from gateway.public_docs import render_public_docs
 from gateway.relay import FALLBACK_ELIGIBLE_ALIASES, relay_chat_completions
+from gateway.responses import create_response
 from gateway.routing import load_routing_table
 
 router = APIRouter()
@@ -118,6 +119,23 @@ async def embeddings(request: Request) -> Response:
     state = request.app.state
     return await create_embeddings(
         state.embedding_client, state.routing, body, deadline
+    )
+
+
+@router.post("/v1/responses")
+async def responses(request: Request) -> Response:
+    deadline = _request_deadline(request)
+    body = await _read_request_body(request, deadline)
+    if isinstance(body, Response):
+        return body
+    state = request.app.state
+    return await create_response(
+        state.chat_client,
+        state.fallback,
+        state.breakers,
+        state.routing,
+        body,
+        deadline,
     )
 
 

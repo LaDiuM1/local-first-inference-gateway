@@ -104,6 +104,11 @@ def is_success_status(status_code: int) -> bool:
     return 200 <= status_code < 300
 
 
+# 2xx 버퍼 본문의 유효성 판정 — 기본은 Chat Completions 최소 계약이고, Responses처럼 더 엄격한
+# 변환 조건이 필요한 경계는 자기 기준의 판정 함수를 중계 경로에 주입한다.
+BodyValidator = Callable[[bytes], bool]
+
+
 def is_valid_chat_completion_body(body: bytes) -> bool:
     """버퍼링된 2xx 본문이 유효한 Chat Completions 응답인지 본다.
 

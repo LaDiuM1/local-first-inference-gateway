@@ -8,7 +8,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from gateway.api_keys import ApiKeyStore, ApiKeyStoreError
 
-MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
+MAX_REQUEST_BODY_MIB = 32
+MAX_REQUEST_BODY_BYTES = MAX_REQUEST_BODY_MIB * 1024 * 1024
 API_CACHE_CONTROL = b"no-store"
 DOCS_CACHE_CONTROL = b"public, max-age=300"
 
@@ -52,7 +53,7 @@ class AuthenticationMiddleware:
 
 
 class RequestBodyLimitMiddleware:
-    """Content-Length와 실제 ASGI 수신 바이트를 모두 20MiB로 제한한다."""
+    """Content-Length와 실제 ASGI 수신 바이트를 모두 공개 상한으로 제한한다."""
 
     def __init__(
         self, app: ASGIApp, maximum_bytes: int = MAX_REQUEST_BODY_BYTES
@@ -198,7 +199,7 @@ def _invalid_content_length_response() -> JSONResponse:
 def _request_too_large_response() -> JSONResponse:
     return _error_response(
         413,
-        "Request body exceeds the 20 MiB limit",
+        f"Request body exceeds the {MAX_REQUEST_BODY_MIB} MiB limit",
         "invalid_request_error",
         "request_too_large",
     )

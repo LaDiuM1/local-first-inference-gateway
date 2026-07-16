@@ -173,7 +173,7 @@ async def test_oversized_content_length_is_rejected_before_body_receive(
 
 
 @respx.mock
-async def test_exact_20_mib_body_reaches_json_parser_and_upstream(
+async def test_exact_32_mib_body_reaches_json_parser_and_upstream(
     gateway_client: httpx.AsyncClient,
 ) -> None:
     upstream = respx.post(UPSTREAM_URL).respond(200, json={"choices": []})
@@ -195,9 +195,8 @@ async def test_exact_20_mib_body_reaches_json_parser_and_upstream(
 async def test_chunked_body_is_stopped_when_actual_bytes_exceed_limit(
     running_gateway: FastAPI, gateway_credentials: GatewayCredentials
 ) -> None:
-    stream = CountingStream(
-        [b"{" + b" " * (10 * 1024 * 1024 - 1), b" " * (10 * 1024 * 1024), b"x", b"tail"]
-    )
+    half = MAX_REQUEST_BODY_BYTES // 2
+    stream = CountingStream([b"{" + b" " * (half - 1), b" " * half, b"x", b"tail"])
     upstream = respx.post(UPSTREAM_URL)
 
     async with await _client(
@@ -217,7 +216,9 @@ async def test_chunked_body_is_stopped_when_actual_bytes_exceed_limit(
 # 과도하게 중첩된 JSON은 표준 JSON 파서의 재귀 한도를 넘긴다. 인증된 요청이 처리되지 않은 500이
 # 아니라 계약 위반 400으로 끝나고 캐시 정책도 그대로 적용되는지 확인한다.
 @pytest.mark.parametrize(
-    "endpoint", ["/v1/chat/completions", "/v1/embeddings"], ids=["chat", "embeddings"]
+    "endpoint",
+    ["/v1/chat/completions", "/v1/responses", "/v1/embeddings"],
+    ids=["chat", "responses", "embeddings"],
 )
 @respx.mock
 async def test_deeply_nested_json_is_400_without_upstream_call(
@@ -285,6 +286,7 @@ async def test_docs_are_public_cached_and_automatic_schema_routes_are_disabled(
     assert docs.headers["cache-control"] == "public, max-age=300"
     assert "https://&lt;public-host&gt;/v1" in docs.text
     assert "1024" in docs.text
+    assert "1536" in docs.text
     assert openapi.status_code == 404
     assert redoc.status_code == 404
 
@@ -297,15 +299,19 @@ def test_public_docs_markdown_is_single_secret_free_contract_source() -> None:
         "https://<public-host>/v1",
         "Authorization: Bearer <API_KEY>",
         "/v1/chat/completions",
+        "/v1/responses",
         "/v1/embeddings",
         "`chat`",
         "`vision`",
         "`embed`",
-        "1024차원",
+        "`gpt-5.4-nano`",
+        "`text-embedding-3-small`",
+        "**1024**",
+        "1536차원",
         "SSE",
         "image_url",
         '"base64"',
-        "20MiB",
+        "32MiB",
         "90초",
         "115초",
         "OpenAI 형식",

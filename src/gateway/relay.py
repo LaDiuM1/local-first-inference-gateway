@@ -9,6 +9,7 @@
 않은 응답) 같은 요청을 OpenAI로 우회한다. 그 밖의 chat 엔드포인트 별칭은 로컬로 라우팅하되 장애 시
 OpenAI를 호출하지 않고 로컬 업스트림 오류를 돌려준다. 별칭별 회로 차단기가 반복 장애를 끊고,
 스트리밍은 첫 바이트를 클라이언트에 보내기 전까지만 폴백하며 이후에는 provider를 섞지 않는다.
+`/v1/responses`의 검색 호환 별칭은 vision으로 정규화돼 이 경로를 그대로 탄다.
 
 폴백 자격은 로컬 상태 코드를 확보한 순간 확정한다 — 폴백 대상 아닌 4xx는 로컬이 판단한 클라이언트
 오류이므로 그 뒤 본문을 읽지 못해도 OpenAI로 넘기지 않고 상태를 보존해 돌려준다.
@@ -38,6 +39,7 @@ from gateway.relay_common import (
     EXCLUDED_STREAMING_HEADERS,
     NORMAL_MODE_EFFORT,
     REASONING_EFFORT_FIELD,
+    BodyValidator,
     ManagedStreamingResponse,
     StreamCleanup,
     StreamPrefix,
@@ -92,8 +94,13 @@ async def relay_chat_completions(
     routing: RoutingTable,
     body: bytes,
     deadline: ResponseStartDeadline,
+    body_validator: BodyValidator = is_valid_chat_completion_body,
 ) -> Response:
-    """사고 수준을 확정하고 별칭을 치환한 뒤, 폴백 자격에 따라 로컬 또는 OpenAI로 중계한다."""
+    """사고 수준을 확정하고 별칭을 치환한 뒤, 폴백 자격에 따라 로컬 또는 OpenAI로 중계한다.
+
+    body_validator는 버퍼 2xx 본문의 로컬 성공·폴백 유효 판정 기준이다 — Responses처럼 변환
+    조건이 더 엄격한 경계는 자기 기준을 넘겨 무효 2xx를 폴백 대상 장애로 만든다.
+    """
     try:
         payload = load_json_object(body)
         _apply_reasoning_effort(payload)
@@ -107,7 +114,9 @@ async def relay_chat_completions(
     breaker = breakers.get(alias)
     if breaker is None:
         # 폴백 비대상 chat 별칭 — 로컬로만 라우팅하고 장애 시 OpenAI를 호출하지 않는다.
-        return await _relay_local_only(local_client, streaming, routed_body, deadline)
+        return await _relay_local_only(
+            local_client, streaming, routed_body, deadline, body_validator
+        )
     return await _relay_eligible(
         local_client,
         fallback,
@@ -116,6 +125,7 @@ async def relay_chat_completions(
         payload,
         routed_body,
         deadline,
+        body_validator,
     )
 
 
@@ -139,15 +149,22 @@ async def _relay_eligible(
     payload: dict,
     routed_body: bytes,
     deadline: ResponseStartDeadline,
+    body_validator: BodyValidator,
 ) -> Response:
     """폴백 대상 별칭 — 회로 차단기 판단에 따라 로컬을 시도하고, 폴백 대상 장애면 OpenAI로 우회한다."""
     attempt = breaker.begin()
     if attempt.decision is LocalDecision.skip:
         return await _fallback(
-            fallback, payload, streaming, deadline.total_remaining_seconds()
+            fallback,
+            payload,
+            streaming,
+            deadline.total_remaining_seconds(),
+            body_validator,
         )
     try:
-        outcome = await _attempt_local(local_client, streaming, routed_body, deadline)
+        outcome = await _attempt_local(
+            local_client, streaming, routed_body, deadline, body_validator
+        )
     except BaseException:
         breaker.release(attempt)
         raise
@@ -169,7 +186,11 @@ async def _relay_eligible(
         )
     breaker.record_failure(attempt)
     return await _fallback(
-        fallback, payload, streaming, deadline.total_remaining_seconds()
+        fallback,
+        payload,
+        streaming,
+        deadline.total_remaining_seconds(),
+        body_validator,
     )
 
 
@@ -178,11 +199,14 @@ async def _relay_local_only(
     streaming: bool,
     routed_body: bytes,
     deadline: ResponseStartDeadline,
+    body_validator: BodyValidator,
 ) -> Response:
     """폴백 비대상 별칭 — 로컬로만 라우팅하고 장애 시 로컬 업스트림 오류를 돌려준다(OpenAI 미호출)."""
     if deadline.local_remaining_seconds() <= 0:
         return response_start_timeout_response()
-    outcome = await _attempt_local(local_client, streaming, routed_body, deadline)
+    outcome = await _attempt_local(
+        local_client, streaming, routed_body, deadline, body_validator
+    )
     if isinstance(outcome, _LocalServed):
         return outcome.response
     if isinstance(outcome, _LocalCommittedStream):
@@ -203,12 +227,13 @@ async def _fallback(
     payload: dict,
     streaming: bool,
     timeout_seconds: float,
+    body_validator: BodyValidator,
 ) -> Response:
     if timeout_seconds <= 0:
         return response_start_timeout_response()
     if streaming:
         return await fallback.relay_stream(payload, timeout_seconds)
-    return await fallback.relay_buffered(payload, timeout_seconds)
+    return await fallback.relay_buffered(payload, timeout_seconds, body_validator)
 
 
 async def _attempt_local(
@@ -216,6 +241,7 @@ async def _attempt_local(
     streaming: bool,
     routed_body: bytes,
     deadline: ResponseStartDeadline,
+    body_validator: BodyValidator,
 ) -> _LocalOutcome:
     """로컬에 요청하고 상태 코드로 폴백 자격을 확정한다 — 본문은 그다음에 읽는다.
 
@@ -244,7 +270,7 @@ async def _attempt_local(
         return _LocalServed(await _serve_confirmed_client_error(response, deadline))
     if streaming:
         return await _commit_local_stream(response, deadline)
-    return await _serve_local_buffered(response, deadline)
+    return await _serve_local_buffered(response, deadline, body_validator)
 
 
 async def _serve_confirmed_client_error(
@@ -269,9 +295,11 @@ async def _serve_confirmed_client_error(
 
 
 async def _serve_local_buffered(
-    response: httpx.Response, deadline: ResponseStartDeadline
+    response: httpx.Response,
+    deadline: ResponseStartDeadline,
+    body_validator: BodyValidator,
 ) -> _LocalServed | _LocalFailed:
-    """로컬 2xx 버퍼 응답 — 유효한 Chat Completions 본문일 때만 그대로 전달한다.
+    """로컬 2xx 버퍼 응답 — 판정 기준을 통과한 본문일 때만 그대로 전달한다.
 
     본문을 읽지 못하거나 유효한 추론 응답이 아니면 로컬이 응답을 만들지 못한 것이므로 폴백 대상이다.
     """
@@ -280,7 +308,7 @@ async def _serve_local_buffered(
             body = await read_and_close_response(response)
     except (httpx.RequestError, TimeoutError):
         return _LocalFailed()
-    if not is_valid_chat_completion_body(body):
+    if not body_validator(body):
         return _LocalFailed()
     return _LocalServed(
         Response(

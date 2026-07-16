@@ -19,7 +19,7 @@ from asgi_lifespan import LifespanManager
 from pydantic import SecretStr
 
 from gateway.config import settings
-from gateway.embeddings import EMBEDDING_VECTOR_DIMENSIONS
+from gateway.embeddings import NATIVE_EMBEDDING_VECTOR_DIMENSIONS
 from gateway.main import create_app
 
 pytestmark = pytest.mark.anyio
@@ -951,7 +951,7 @@ async def test_embed_uses_dedicated_base_url(
         200,
         json={
             "model": "snowflake-arctic-embed2",
-            "embeddings": [[0.1] * EMBEDDING_VECTOR_DIMENSIONS],
+            "embeddings": [[0.1] * NATIVE_EMBEDDING_VECTOR_DIMENSIONS],
         },
     )
     other = respx.post(LOCAL_URL)

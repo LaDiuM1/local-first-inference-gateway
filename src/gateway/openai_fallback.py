@@ -24,6 +24,7 @@ from gateway.relay_common import (
     NORMAL_MODE_EFFORT,
     OPENAI_MINIMAL_EFFORT,
     REASONING_EFFORT_FIELD,
+    BodyValidator,
     ManagedStreamingResponse,
     StreamCleanup,
     is_success_status,
@@ -51,7 +52,10 @@ class OpenAIFallback:
         self._api_key = api_key
 
     async def relay_buffered(
-        self, routed_payload: dict, response_start_timeout_seconds: float
+        self,
+        routed_payload: dict,
+        response_start_timeout_seconds: float,
+        body_validator: BodyValidator = is_valid_chat_completion_body,
     ) -> Response:
         headers = self._auth_headers()
         if headers is None:
@@ -69,11 +73,11 @@ class OpenAIFallback:
             return fallback_unavailable_response(
                 f"connection failed: {type(error).__name__}"
             )
-        # 2xx인데 유효한 Chat Completions 응답이 아니면 비밀 없는 502로 합성한다.
+        # 2xx인데 판정 기준을 통과한 응답이 아니면 비밀 없는 502로 합성한다.
         # 오류 상태(비2xx)는 provider의 오류 본문을 그대로 클라이언트에 전달한다.
-        if is_success_status(
-            response.status_code
-        ) and not is_valid_chat_completion_body(response.content):
+        if is_success_status(response.status_code) and not body_validator(
+            response.content
+        ):
             return fallback_unavailable_response(_INVALID_RESPONSE_DETAIL)
         return Response(
             content=response.content,

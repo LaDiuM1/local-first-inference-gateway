@@ -21,17 +21,24 @@ Authorization: Bearer <API_KEY>
 ## 지원 엔드포인트와 모델 별칭
 
 - `POST /v1/chat/completions`: 대화형 생성과 이미지 분석
+- `POST /v1/responses`: OpenAI Responses 형식의 이미지 분석
 - `POST /v1/embeddings`: 문자열 또는 문자열 배열 임베딩
 - `GET /health`: 인증된 운영 상태 확인
 - `GET /docs`: 인증 없이 읽을 수 있는 이 문서
 
-클라이언트는 실제 provider 모델명이 아니라 다음 별칭을 사용한다.
+클라이언트는 실제 provider 모델명이 아니라 다음 별칭을 사용한다. 별칭은 허용된 엔드포인트에서만 쓸 수 있고, 다른 조합은 업스트림 호출 없이 `400`으로 거절된다.
 
-- `chat`: 일반 대화형 생성
-- `vision`: 이미지가 포함된 대화형 생성
-- `embed`: 임베딩 생성
+| 별칭 | 허용 엔드포인트 | 용도 | 임베딩 차원 |
+|---|---|---|---|
+| `chat` | `/v1/chat/completions` | 일반 대화형 생성 | — |
+| `vision` | `/v1/chat/completions` | 이미지가 포함된 대화형 생성 | — |
+| `embed` | `/v1/embeddings` | 임베딩 생성 | **1024** |
+| `gpt-5.4-nano` | `/v1/responses` | 검색 모듈 Responses 이미지 분석 호환 별칭 | — |
+| `text-embedding-3-small` | `/v1/embeddings` | 검색 모듈 임베딩 호환 별칭 | **1536** |
 
-임베딩 벡터는 항상 **1024차원**이다. 임베딩 모델과 차원은 기존 색인과 같은 벡터 공간을 유지하기 위한 계약이므로 클라이언트가 임의로 바꾸지 않는다.
+`embed`는 로컬 임베딩 모델의 1024차원 벡터를 그대로 반환한다. `text-embedding-3-small`은 같은 모델의 1024차원 벡터 뒤에 512개의 0을 붙여 OpenAI와 같은 1536차원으로 반환하며, zero-padding은 코사인 유사도를 그대로 보존한다. 두 별칭은 같은 모델의 같은 벡터 공간을 쓰므로 차원만 다르다. 다만 이 벡터는 OpenAI `text-embedding-3-small`과 차원만 같고 벡터 공간은 다르므로, provider를 전환할 때는 기존 벡터를 섞지 말고 전체 색인을 다시 만들어야 한다.
+
+`/v1/responses`와 `/v1/embeddings`의 응답 `model`은 요청에 보낸 별칭을 그대로 돌려준다. `/v1/chat/completions`의 응답 `model`은 실제 요청을 처리한 provider 모델명이라 폴백·모델 교체에 따라 달라질 수 있으므로 비즈니스 로직의 분기 조건으로 사용하지 않는다.
 
 ## Chat Completions
 
@@ -120,7 +127,7 @@ data: [DONE]
 
 ## 이미지 분석
 
-이미지는 OpenAI Chat Completions의 다중 콘텐츠 형식으로 전달하고 `vision` 별칭을 사용한다. 아래 예시의 base64 문자열은 실제 이미지 데이터로 바꾼다.
+이미지는 Base64 data URL로 전달한다. OpenAI Chat Completions 형식은 `vision` 별칭을 사용한다. 아래 예시의 base64 문자열은 실제 이미지 데이터로 바꾼다.
 
 ```json
 {
@@ -133,6 +140,31 @@ data: [DONE]
         {
           "type": "image_url",
           "image_url": {"url": "data:image/jpeg;base64,<BASE64_IMAGE>"}
+        }
+      ]
+    }
+  ]
+}
+```
+
+검색 모듈처럼 OpenAI Responses 형식을 사용하는 클라이언트는 기존 OpenAI 모델 설정을 유지한 채 다음 요청을 보낼 수 있다. `/v1/responses`는 `gpt-5.4-nano` 별칭만 받고 내부에서 `vision`과 같은 라우팅·폴백 정책으로 처리한다. 현재 지원 범위는 비스트리밍 이미지 분석이며, 성공 응답의 분석 문장은 `output[].content[]` 중 `type`이 `output_text`인 항목의 `text`에 있다.
+
+요청 최상위 필드는 `model`, `instructions`, `input`, `stream`(`false`만)을 지원한다. 그 밖의 필드는 무시하고 처리하는 대신 업스트림 호출 전에 `400`으로 거절하므로, 적용되지 않는 생성 파라미터가 적용된 것처럼 보이는 일이 없다. 이미지 `detail`은 `auto`, `low`, `high`만 허용한다.
+
+응답 생성이 정상 종료되면 `status`는 `completed`다. 토큰 한도 등으로 생성이 중단되면 `status`가 `incomplete`가 되고 `incomplete_details.reason`(`max_output_tokens` 또는 `content_filter`)에 사유가 담기므로, 클라이언트는 `completed`가 아닌 응답을 완전한 결과로 저장하지 않아야 한다.
+
+```json
+{
+  "model": "gpt-5.4-nano",
+  "instructions": "이미지에 직접 보이는 사실만 설명해 줘.",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "input_text", "text": "검색에 사용할 특징을 한 줄로 설명해 줘."},
+        {
+          "type": "input_image",
+          "image_url": "data:image/jpeg;base64,<BASE64_IMAGE>"
         }
       ]
     }
@@ -163,7 +195,7 @@ data: [DONE]
 }
 ```
 
-기본 `encoding_format`은 `float`이다. 성공 응답의 각 `embedding`은 1024개 숫자로 구성된다. 아래 응답은 표현 형식만 보여 주기 위해 벡터 값을 축약한 예시다.
+기본 `encoding_format`은 `float`이다. 성공 응답의 각 `embedding`은 `embed`가 1024개, `text-embedding-3-small`이 1536개 숫자로 구성된다. `dimensions`는 지정하지 않아도 되며, 지정하면 별칭의 차원(1024 또는 1536)과 같아야 하고 다른 값은 `400`으로 거절된다 — 이 게이트웨이는 차원 축소를 지원하지 않는다. 아래 응답은 표현 형식만 보여 주기 위해 벡터 값을 축약한 예시다.
 
 ```json
 {
@@ -171,12 +203,12 @@ data: [DONE]
   "data": [
     {"object": "embedding", "index": 0, "embedding": [0.012, -0.034]}
   ],
-  "model": "provider-model",
+  "model": "embed",
   "usage": {"prompt_tokens": 3, "total_tokens": 3}
 }
 ```
 
-`encoding_format: "base64"`를 지정하면 각 벡터는 1024개의 float32 리틀엔디언 바이트를 base64로 인코딩한 문자열로 반환된다.
+`encoding_format: "base64"`를 지정하면 각 벡터는 별칭의 차원 수(1024 또는 1536)만큼의 float32 리틀엔디언 바이트를 base64로 인코딩한 문자열로 반환된다.
 
 ```json
 {
@@ -188,7 +220,7 @@ data: [DONE]
 
 ## 요청 크기 제한
 
-`/v1/*` 요청의 전체 HTTP 본문은 최대 **20MiB(20 × 1024 × 1024 바이트)** 다. 이 제한은 이미지 원본 크기가 아니라 base64 인코딩과 JSON 구조를 모두 포함하여 실제 전송되는 최종 본문 크기에 적용된다. `Content-Length`가 없더라도 실제 수신 바이트를 기준으로 검사하며, 초과 요청은 JSON 파싱과 추론 호출 전에 `413 Payload Too Large`로 거절된다.
+`/v1/*` 요청의 전체 HTTP 본문은 최대 **32MiB(32 × 1024 × 1024 바이트)** 다. 이 제한은 이미지 원본 크기가 아니라 base64 인코딩과 JSON 구조를 모두 포함하여 실제 전송되는 최종 본문 크기에 적용된다. 검색 모듈의 20MiB 업로드 파일도 Base64 팽창 후 이 범위에 들어온다. `Content-Length`가 없더라도 실제 수신 바이트를 기준으로 검사하며, 초과 요청은 JSON 파싱과 추론 호출 전에 `413 Payload Too Large`로 거절된다.
 
 ## 응답 시작 기한
 
@@ -211,9 +243,9 @@ data: [DONE]
 
 주요 상태 코드는 다음과 같다.
 
-- `400 Bad Request`: JSON 또는 지원 필드와 모델 별칭이 잘못됨
+- `400 Bad Request`: JSON, 지원 필드, 모델 별칭 또는 별칭-엔드포인트 조합이 잘못됨
 - `401 Unauthorized`: API 키가 없거나 잘못됐거나 폐기됨
-- `413 Payload Too Large`: 전체 요청 본문이 20MiB를 초과함
+- `413 Payload Too Large`: 전체 요청 본문이 32MiB를 초과함
 - `502 Bad Gateway`: 로컬 또는 폴백 provider가 유효한 응답을 제공하지 못함
 - `503 Service Unavailable`: 인증 저장소 등 게이트웨이 운영 상태를 사용할 수 없음
 - `504 Gateway Timeout`: 전체 응답 시작 기한 안에 유효한 결과를 확보하지 못함

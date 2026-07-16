@@ -1,6 +1,8 @@
 # 용도별 별칭 → 실제 모델 라우팅.
 # 클라이언트(openAt)는 이 별칭만 호출하고, 실제 모델의 선택과 교체는 이 파일 수정으로만 이뤄진다.
-# endpoint는 별칭이 서비스하는 OpenAI 엔드포인트다 — chat(=/v1/chat/completions), embeddings(=/v1/embeddings).
+# endpoint는 별칭이 내부에서 사용하는 OpenAI 엔드포인트다.
+# 검색 모듈 호환 별칭은 여기 없다 — gpt-5.4-nano(/v1/responses)는 vision으로,
+# text-embedding-3-small(/v1/embeddings)은 embed로 코드에서 정규화돼 같은 라우트를 쓴다.
 routes:
   - alias: chat
     endpoint: chat

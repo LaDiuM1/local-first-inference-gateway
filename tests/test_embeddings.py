@@ -9,7 +9,11 @@ import pytest
 import respx
 
 from gateway.config import settings
-from gateway.embeddings import EMBEDDING_VECTOR_DIMENSIONS
+from gateway.embeddings import (
+    ALIAS_VECTOR_DIMENSIONS,
+    NATIVE_EMBEDDING_VECTOR_DIMENSIONS,
+    OPENAI_COMPAT_VECTOR_DIMENSIONS,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -17,15 +21,22 @@ pytestmark = pytest.mark.anyio
 UPSTREAM_URL = f"{settings.embedding_ollama_base_url}/api/embed"
 OPENAI_URL = f"{settings.openai_base_url}/chat/completions"
 EMBED_ALIAS = "embed"
+OPENAI_EMBED_MODEL = "text-embedding-3-small"
 EMBED_MODEL = "snowflake-arctic-embed2"
 
 
 def _vector(start: float = 0.0) -> list[float]:
-    """계약 차원(1024)을 채운 벡터 — 성분마다 값이 달라 순서 보존도 함께 확인한다."""
+    """로컬 모델의 1024차원 벡터 — 성분마다 값이 달라 순서 보존도 함께 확인한다."""
     return [
-        round(start + index / EMBEDDING_VECTOR_DIMENSIONS, 6)
-        for index in range(EMBEDDING_VECTOR_DIMENSIONS)
+        round(start + index / NATIVE_EMBEDDING_VECTOR_DIMENSIONS, 6)
+        for index in range(NATIVE_EMBEDDING_VECTOR_DIMENSIONS)
     ]
+
+
+def _padded_vector(vector: list[float]) -> list[float]:
+    """OpenAI 호환 별칭의 공개 벡터 — 1024차원 뒤에 0을 붙여 1536차원으로 만든다."""
+    padding = OPENAI_COMPAT_VECTOR_DIMENSIONS - NATIVE_EMBEDDING_VECTOR_DIMENSIONS
+    return [*vector, *([0.0] * padding)]
 
 
 def _native_response(vectors: list[list[float]], prompt_tokens: int = 3) -> dict:
@@ -42,7 +53,7 @@ def _native_body_with_value(raw_value: bytes) -> bytes:
     차원은 계약대로 맞춰 값 검증만 남긴다 — 짧은 벡터로 만들면 차원 검사에서 먼저 걸려 값 검증이
     실행되지 않는다.
     """
-    components = [b"0.1"] * (EMBEDDING_VECTOR_DIMENSIONS - 1) + [raw_value]
+    components = [b"0.1"] * (NATIVE_EMBEDDING_VECTOR_DIMENSIONS - 1) + [raw_value]
     return (
         b'{"model":"snowflake-arctic-embed2","embeddings":[['
         + b",".join(components)
@@ -55,9 +66,14 @@ def _decode_base64(encoded: str, dimensions: int) -> list[float]:
     return list(struct.unpack(f"<{dimensions}f", base64.b64decode(encoded)))
 
 
-def test_embed_external_contract_dimension_is_1024() -> None:
-    # 공개 연동 가이드(docs/API.md)가 클라이언트에 공표한 값 — 바뀌면 기존 색인과 벡터 공간이 깨진다.
-    assert EMBEDDING_VECTOR_DIMENSIONS == 1024
+def test_alias_dimension_contract() -> None:
+    """별칭별 공개 차원 계약 — embed는 native 1024, OpenAI 호환 별칭은 1536이다."""
+    assert NATIVE_EMBEDDING_VECTOR_DIMENSIONS == 1024
+    assert OPENAI_COMPAT_VECTOR_DIMENSIONS == 1536
+    assert ALIAS_VECTOR_DIMENSIONS == {
+        EMBED_ALIAS: 1024,
+        OPENAI_EMBED_MODEL: 1536,
+    }
 
 
 @respx.mock
@@ -74,7 +90,7 @@ async def test_embed_single_string_converts_to_openai_format(
     assert response.status_code == 200
     body = response.json()
     assert body["object"] == "list"
-    assert body["model"] == EMBED_MODEL
+    assert body["model"] == EMBED_ALIAS
     assert body["data"] == [{"object": "embedding", "index": 0, "embedding": vector}]
     assert body["usage"] == {"prompt_tokens": 3, "total_tokens": 3}
 
@@ -82,6 +98,99 @@ async def test_embed_single_string_converts_to_openai_format(
     assert native_request["model"] == EMBED_MODEL
     assert native_request["input"] == "상품 설명"
     assert native_request["options"] == {"num_gpu": 0}
+
+
+@respx.mock
+async def test_openai_model_name_is_a_1536_dimension_compatibility_alias(
+    gateway_client: httpx.AsyncClient,
+) -> None:
+    native_vector = _vector()
+    route = respx.post(UPSTREAM_URL).respond(
+        200, json=_native_response([native_vector])
+    )
+
+    response = await gateway_client.post(
+        "/v1/embeddings",
+        json={"model": OPENAI_EMBED_MODEL, "input": "상품 설명"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    embedding = body["data"][0]["embedding"]
+    assert body["model"] == OPENAI_EMBED_MODEL
+    assert embedding[:NATIVE_EMBEDDING_VECTOR_DIMENSIONS] == native_vector
+    assert embedding[NATIVE_EMBEDDING_VECTOR_DIMENSIONS:] == [0.0] * 512
+    assert len(embedding) == OPENAI_COMPAT_VECTOR_DIMENSIONS
+    # 호환 별칭도 내부 embed 라우트로 정규화돼 같은 모델을 호출한다 — 벡터 공간은 하나다.
+    assert json.loads(route.calls.last.request.content)["model"] == EMBED_MODEL
+
+
+@respx.mock
+async def test_openai_alias_batch_preserves_order_with_padding(
+    gateway_client: httpx.AsyncClient,
+) -> None:
+    vectors = [_vector(0.1), _vector(0.3)]
+    respx.post(UPSTREAM_URL).respond(200, json=_native_response(vectors))
+
+    response = await gateway_client.post(
+        "/v1/embeddings", json={"model": OPENAI_EMBED_MODEL, "input": ["a", "b"]}
+    )
+
+    data = response.json()["data"]
+    assert [item["index"] for item in data] == [0, 1]
+    assert [item["embedding"] for item in data] == [
+        _padded_vector(vector) for vector in vectors
+    ]
+
+
+@respx.mock
+async def test_openai_alias_base64_returns_decodable_1536_float32(
+    gateway_client: httpx.AsyncClient,
+) -> None:
+    vector = _vector()
+    respx.post(UPSTREAM_URL).respond(200, json=_native_response([vector]))
+
+    response = await gateway_client.post(
+        "/v1/embeddings",
+        json={"model": OPENAI_EMBED_MODEL, "input": "x", "encoding_format": "base64"},
+    )
+
+    encoded = response.json()["data"][0]["embedding"]
+    assert isinstance(encoded, str)
+    assert _decode_base64(encoded, OPENAI_COMPAT_VECTOR_DIMENSIONS) == pytest.approx(
+        _padded_vector(vector)
+    )
+
+
+@respx.mock
+async def test_explicit_1536_dimensions_is_accepted(
+    gateway_client: httpx.AsyncClient,
+) -> None:
+    route = respx.post(UPSTREAM_URL).respond(200, json=_native_response([_vector()]))
+
+    response = await gateway_client.post(
+        "/v1/embeddings",
+        json={"model": OPENAI_EMBED_MODEL, "input": "x", "dimensions": 1536},
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()["data"][0]["embedding"]) == 1536
+    assert "dimensions" not in json.loads(route.calls.last.request.content)
+
+
+@respx.mock
+async def test_embed_explicit_1024_dimensions_is_accepted(
+    gateway_client: httpx.AsyncClient,
+) -> None:
+    respx.post(UPSTREAM_URL).respond(200, json=_native_response([_vector()]))
+
+    response = await gateway_client.post(
+        "/v1/embeddings",
+        json={"model": EMBED_ALIAS, "input": "x", "dimensions": 1024},
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()["data"][0]["embedding"]) == 1024
 
 
 @respx.mock
@@ -151,7 +260,9 @@ async def test_embed_base64_returns_decodable_float32(
 
     encoded = response.json()["data"][0]["embedding"]
     assert isinstance(encoded, str)
-    assert _decode_base64(encoded, len(vector)) == pytest.approx(vector)
+    assert _decode_base64(encoded, NATIVE_EMBEDDING_VECTOR_DIMENSIONS) == pytest.approx(
+        vector
+    )
 
 
 @respx.mock
@@ -169,7 +280,9 @@ async def test_embed_base64_array_preserves_order_and_cpu_option(
     data = response.json()["data"]
     assert [item["index"] for item in data] == [0, 1]
     for item, vector in zip(data, vectors, strict=True):
-        assert _decode_base64(item["embedding"], len(vector)) == pytest.approx(vector)
+        assert _decode_base64(
+            item["embedding"], NATIVE_EMBEDDING_VECTOR_DIMENSIONS
+        ) == pytest.approx(vector)
     native_request = json.loads(route.calls.last.request.content)
     assert native_request["options"] == {"num_gpu": 0}
     assert "encoding_format" not in native_request
@@ -189,6 +302,56 @@ async def test_embed_unsupported_encoding_format_gets_400_without_upstream_call(
     response = await gateway_client.post(
         "/v1/embeddings",
         json={"model": EMBED_ALIAS, "input": "x", "encoding_format": encoding_format},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert not route.called
+
+
+# dimensions는 별칭의 고정 차원만 허용한다 — 호환 별칭에 1024를, embed에 1536을 요청해도 거절된다.
+@pytest.mark.parametrize(
+    ("model", "dimensions"),
+    [
+        (OPENAI_EMBED_MODEL, 1024),
+        (OPENAI_EMBED_MODEL, 1535),
+        (OPENAI_EMBED_MODEL, 1537),
+        (OPENAI_EMBED_MODEL, True),
+        (OPENAI_EMBED_MODEL, "1536"),
+        (EMBED_ALIAS, 1536),
+        (EMBED_ALIAS, 512),
+        (EMBED_ALIAS, "1024"),
+    ],
+)
+@respx.mock
+async def test_embed_unsupported_dimensions_gets_400_without_upstream_call(
+    gateway_client: httpx.AsyncClient, model: str, dimensions: object
+) -> None:
+    route = respx.post(UPSTREAM_URL)
+
+    response = await gateway_client.post(
+        "/v1/embeddings",
+        json={"model": model, "input": "x", "dimensions": dimensions},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert not route.called
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["chat", "vision", "snowflake-arctic-embed2", "text-embedding-3-large"],
+    ids=["chat-alias", "vision-alias", "real-model-name", "unregistered-openai-name"],
+)
+@respx.mock
+async def test_embeddings_rejects_non_embedding_aliases_without_upstream_call(
+    gateway_client: httpx.AsyncClient, model: str
+) -> None:
+    route = respx.post(UPSTREAM_URL)
+
+    response = await gateway_client.post(
+        "/v1/embeddings", json={"model": model, "input": "x"}
     )
 
     assert response.status_code == 400
@@ -362,7 +525,10 @@ async def test_embed_vector_count_mismatch_returns_openai_shaped_502(
 @pytest.mark.parametrize("encoding_format", ["float", "base64"])
 @pytest.mark.parametrize(
     "dimensions",
-    [EMBEDDING_VECTOR_DIMENSIONS - 1, EMBEDDING_VECTOR_DIMENSIONS + 1],
+    [
+        NATIVE_EMBEDDING_VECTOR_DIMENSIONS - 1,
+        NATIVE_EMBEDDING_VECTOR_DIMENSIONS + 1,
+    ],
     ids=["one-short", "one-long"],
 )
 @respx.mock
@@ -387,7 +553,7 @@ async def test_embed_batch_with_consistently_wrong_dimensions_returns_502(
     gateway_client: httpx.AsyncClient,
 ) -> None:
     # 벡터끼리 차원이 같아도 계약 차원이 아니면 통과시키지 않는다.
-    wrong = [0.1] * (EMBEDDING_VECTOR_DIMENSIONS // 2)
+    wrong = [0.1] * (NATIVE_EMBEDDING_VECTOR_DIMENSIONS // 2)
     respx.post(UPSTREAM_URL).respond(200, json=_native_response([wrong, wrong]))
     openai = respx.post(OPENAI_URL)
 
@@ -406,7 +572,9 @@ async def test_embed_mixed_vector_dimensions_return_502_without_openai(
 ) -> None:
     respx.post(UPSTREAM_URL).respond(
         200,
-        json=_native_response([_vector(), [0.3] * (EMBEDDING_VECTOR_DIMENSIONS - 1)]),
+        json=_native_response(
+            [_vector(), [0.3] * (NATIVE_EMBEDDING_VECTOR_DIMENSIONS - 1)]
+        ),
     )
     openai = respx.post(OPENAI_URL)
 

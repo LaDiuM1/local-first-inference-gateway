@@ -40,11 +40,14 @@ def local_inference_unavailable_response() -> JSONResponse:
     )
 
 
-def upstream_invalid_response() -> JSONResponse:
-    """임베딩 업스트림이 200이지만 유효한 임베딩 응답을 못 줬다 — 비밀 없는 일반 오류로 합성한다."""
+def upstream_invalid_response(kind: str) -> JSONResponse:
+    """업스트림이 성공 상태지만 유효한 응답 본문을 못 줬다 — 비밀 없는 일반 오류로 합성한다.
+
+    kind는 어떤 계약의 응답이 무효였는지 알려 주는 명사(embedding·inference)다.
+    """
     return _error_response(
         status_code=502,
-        message="upstream returned an invalid embedding response",
+        message=f"upstream returned an invalid {kind} response",
         error_type="upstream_error",
         code="upstream_invalid_response",
     )

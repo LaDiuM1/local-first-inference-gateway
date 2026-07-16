@@ -1,4 +1,4 @@
-"""6단계 결정적 검증: 인증·본문 제한·캐시·기한·스트리밍·임베딩 미폴백을 fake로 확인한다.
+"""6단계 결정적 검증: 인증·본문 제한·캐시·기한·스트리밍·임베딩 미폴백·검색 호환 별칭을 fake로 확인한다.
 
 기본 모드는 게이트웨이의 세 업스트림을 모두 로컬 fake 서버로 돌리며 실제 OpenAI, Ollama,
 Cloudflare를 호출하지 않는다. `--public-host`를 명시하면 로컬 검증 뒤 공개 `/docs`와 인증된
@@ -35,12 +35,14 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(errors="backslashreplace")
 
 HOST = "127.0.0.1"
-MAX_BODY_BYTES = 20 * 1024 * 1024
+MAX_BODY_BYTES = 32 * 1024 * 1024
 LOCAL_DEADLINE_SECONDS = 0.15
 TOTAL_DEADLINE_SECONDS = 0.4
 STARTUP_TIMEOUT_SECONDS = 15
 REQUEST_TIMEOUT_SECONDS = 5
+# embed 별칭은 native 1024차원 그대로, 검색 호환 별칭은 zero-padding으로 1536차원을 공개한다.
 EMBED_DIMENSIONS = 1024
+OPENAI_COMPAT_EMBED_DIMENSIONS = 1536
 
 
 def free_port() -> int:
@@ -155,7 +157,6 @@ async def fake_embed(request: Request) -> object:
         count = len(embedding_input)
     dimensions = EMBED_DIMENSIONS
     if CONTROL["embed"] == "wrong_dimensions":
-        # 벡터끼리는 차원이 같지만 외부 계약(1024)이 아니다 — 기존 색인과 벡터 공간이 다르다.
         dimensions = EMBED_DIMENSIONS // 2
     vectors = [[float(index) / dimensions for index in range(dimensions)]]
     return JSONResponse(
@@ -252,7 +253,7 @@ def oversized_content_length() -> tuple[int, dict]:
 
 def oversized_chunks() -> Iterator[bytes]:
     chunk_size = 4 * 1024 * 1024
-    for _ in range(5):
+    for _ in range(8):
         yield b" " * chunk_size
     yield b"x"
 
@@ -319,7 +320,8 @@ def run_local_verification() -> None:
             "공개 docs 5분 캐시",
             docs.status_code == 200
             and docs.headers.get("cache-control") == "public, max-age=300"
-            and "1024" in docs.text,
+            and "1024" in docs.text
+            and "1536" in docs.text,
             f"HTTP {docs.status_code}, cache={docs.headers.get('cache-control')}",
         )
         check(
@@ -403,6 +405,46 @@ def run_local_verification() -> None:
             f"종료={stream_error}, OpenAI 추가 호출={STATS['openai'] - openai_before}",
         )
 
+        CONTROL["chat"] = "ok"
+        responses_success = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.4-nano",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "특징 설명"}],
+                    }
+                ],
+            },
+        )
+        responses_body = responses_success.json()
+        check(
+            "Responses 호환 별칭 변환",
+            responses_success.status_code == 200
+            and responses_body.get("status") == "completed"
+            and responses_body.get("model") == "gpt-5.4-nano"
+            and responses_body["output"][0]["content"][0]["text"] == "local",
+            f"HTTP {responses_success.status_code}",
+        )
+        wrong_endpoint_responses = client.post(
+            "/v1/responses", json={"model": "chat", "input": "x"}
+        )
+        wrong_endpoint_chat = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-5.4-nano",
+                "messages": [{"role": "user", "content": "x"}],
+            },
+        )
+        check(
+            "별칭-엔드포인트 경계 400",
+            wrong_endpoint_responses.status_code == 400
+            and wrong_endpoint_chat.status_code == 400,
+            f"responses={wrong_endpoint_responses.status_code}, "
+            f"chat={wrong_endpoint_chat.status_code}",
+        )
+
         CONTROL["embed"] = "ok"
         single = client.post(
             "/v1/embeddings",
@@ -432,6 +474,20 @@ def run_local_verification() -> None:
                 for item in encoded_body["data"]
             ),
             f"HTTP {encoded.status_code}, {len(encoded_body.get('data', []))}건",
+        )
+        compat = client.post(
+            "/v1/embeddings",
+            json={"model": "text-embedding-3-small", "input": "x"},
+        )
+        compat_vector = compat.json()["data"][0]["embedding"]
+        check(
+            "호환 별칭 1536차원 zero-padding",
+            compat.status_code == 200
+            and compat.json()["model"] == "text-embedding-3-small"
+            and len(compat_vector) == OPENAI_COMPAT_EMBED_DIMENSIONS
+            and compat_vector[EMBED_DIMENSIONS:]
+            == [0.0] * (OPENAI_COMPAT_EMBED_DIMENSIONS - EMBED_DIMENSIONS),
+            f"HTTP {compat.status_code}, {len(compat_vector)}차원",
         )
 
         CONTROL["embed"] = "wrong_dimensions"

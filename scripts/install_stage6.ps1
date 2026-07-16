@@ -241,7 +241,9 @@ function Ensure-TaskFolder {
     $scheduler.Connect()
     $root = $scheduler.GetFolder("\")
     try {
-        $null = $scheduler.GetFolder($TaskPath)
+        # COM GetFolder는 후행 백슬래시 경로를 거부한다(0x8007007B) — 그대로 넘기면 폴더가
+        # 있어도 catch로 빠져 재설치가 CreateFolder 중복 오류로 중단된다.
+        $null = $scheduler.GetFolder("\" + $TaskPath.Trim("\"))
     }
     catch {
         $null = $root.CreateFolder($TaskPath.Trim("\"), $null)

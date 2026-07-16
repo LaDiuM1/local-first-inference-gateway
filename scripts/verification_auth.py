@@ -45,6 +45,10 @@ class VerificationAuth:
 
     def apply_to(self, environment: dict[str, str]) -> None:
         environment[_STORE_PATH_VARIABLE] = str(self.store_path)
+        # 검증 게이트웨이의 요청 관측 로그도 임시 디렉터리로 격리한다 — 운영 로그를 오염시키지 않는다.
+        environment["GATEWAY_REQUEST_LOG_DIRECTORY"] = str(
+            Path(self._directory.name) / "request-logs"
+        )
         # 검증 게이트웨이는 별도 프로세스다 — 이 모듈을 팩터리로 import할 수 있어야 한다.
         scripts_directory = str(Path(__file__).resolve().parent)
         existing = environment.get("PYTHONPATH")

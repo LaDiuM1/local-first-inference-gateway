@@ -28,7 +28,7 @@ GATEWAY_TASK_NAME = "Gateway"
 CHAT_TASK_NAME = "Chat Ollama"
 EMBEDDING_TASK_NAME = "Embedding Ollama"
 CLOUDFLARED_SERVICE_NAME = "cloudflared"
-GATEWAY_HEALTH_URL = "http://127.0.0.1:8000/health"
+GATEWAY_HEALTH_URL = "http://127.0.0.1:29000/health"
 CHAT_HEALTH_URL = "http://127.0.0.1:11434/api/version"
 EMBEDDING_HEALTH_URL = "http://127.0.0.1:11435/api/version"
 

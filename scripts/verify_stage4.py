@@ -20,6 +20,7 @@
 
 import base64
 import os
+import socket
 import struct
 import subprocess
 import sys
@@ -33,7 +34,15 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(errors="backslashreplace")
 
 GATEWAY_HOST = "127.0.0.1"
-GATEWAY_PORT = 8000
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((GATEWAY_HOST, 0))
+        return probe.getsockname()[1]
+
+
+GATEWAY_PORT = free_port()
 GATEWAY_BASE_URL = f"http://{GATEWAY_HOST}:{GATEWAY_PORT}"
 CHAT_OLLAMA_BASE_URL = os.environ.get(
     "GATEWAY_OLLAMA_BASE_URL", "http://127.0.0.1:11434"

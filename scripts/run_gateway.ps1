@@ -3,7 +3,7 @@
   FastAPI 게이트웨이를 loopback에서 독립 실행하고 종료 시 backoff로 재기동한다.
 #>
 param(
-    [int]$Port = 8000,
+    [int]$Port = 29000,
     [string]$ProjectRoot = "",
     [string]$PythonPath = "",
     [string[]]$GatewayCommand = @(),

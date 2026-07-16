@@ -7,6 +7,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from gateway.api_keys import ApiKeyStore, ApiKeyStoreError
+from gateway.observability import observe_client
 
 MAX_REQUEST_BODY_MIB = 32
 MAX_REQUEST_BODY_BYTES = MAX_REQUEST_BODY_MIB * 1024 * 1024
@@ -35,7 +36,8 @@ class AuthenticationMiddleware:
             await self._app(scope, receive, send)
             return
 
-        scope.setdefault("state", {})["request_started_at"] = self._clock()
+        # 관측 미들웨어가 바깥에서 도착 시각을 먼저 찍는다 — 없을 때만 여기서 기준점을 만든다.
+        scope.setdefault("state", {}).setdefault("request_started_at", self._clock())
         api_key = _bearer_token(scope)
         if api_key is None:
             await _unauthorized_response()(scope, receive, send)
@@ -49,6 +51,7 @@ class AuthenticationMiddleware:
             await _unauthorized_response()(scope, receive, send)
             return
         scope["state"]["api_key_identity"] = identity
+        observe_client(identity.client, identity.key_id)
         await self._app(scope, receive, send)
 
 

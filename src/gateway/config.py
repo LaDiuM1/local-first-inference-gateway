@@ -11,6 +11,8 @@ from pathlib import Path
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from gateway.paths import STATE_DIRECTORY
+
 
 class Settings(BaseSettings):
     # .env에는 다른 용도의 키(OPENAI_API_KEY 등)도 있으므로 GATEWAY_ 필드 외는 무시한다.
@@ -31,6 +33,10 @@ class Settings(BaseSettings):
     # 별칭별 회로 차단기 — 연속 실패가 임계값에 닿으면 open_seconds 동안 로컬을 건너뛴다.
     circuit_breaker_failure_threshold: int = 3
     circuit_breaker_open_seconds: float = 30.0
+
+    # 요청 관측 JSON Lines 로그 디렉터리 — 운영 기본은 상태 디렉터리 하위이고, 열 수 없으면
+    # 기동에 실패한다. 검증·테스트는 이 값을 임시 경로로 바꿔 운영 로그와 격리한다.
+    request_log_directory: Path = STATE_DIRECTORY / "logs"
 
     # OpenAI 폴백 — chat·vision 별칭만 로컬 장애 시 우회한다. 폴백 모델은 계약상 고정이라 설정으로
     # 열지 않고 openai_fallback 모듈 상수로 둔다.

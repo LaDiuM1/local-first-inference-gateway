@@ -43,10 +43,13 @@ class CircuitBreaker:
         failure_threshold: int,
         open_seconds: float,
         clock: Callable[[], float],
+        on_transition: Callable[[str], None] | None = None,
     ) -> None:
         self._failure_threshold = failure_threshold
         self._open_seconds = open_seconds
         self._clock = clock
+        # 상태 전환 관측 훅 — 새 상태 이름(closed·open·half_open)만 받는다.
+        self._on_transition = on_transition
         self._state = _State.closed
         self._consecutive_failures = 0
         self._opened_at = 0.0
@@ -103,3 +106,5 @@ class CircuitBreaker:
             self._consecutive_failures = 0
         elif state is _State.open:
             self._opened_at = self._clock()
+        if self._on_transition is not None:
+            self._on_transition(state.value)

@@ -32,6 +32,14 @@ from gateway.errors import (
     response_start_timeout_response,
     upstream_body_unavailable_response,
 )
+from gateway.observability import (
+    observe_alias,
+    observe_local_failure,
+    observe_provider,
+    observe_response_start,
+    observe_stream,
+    observe_upstream_start,
+)
 from gateway.openai_fallback import OpenAIFallback
 from gateway.relay_common import (
     CHAT_COMPLETIONS_PATH,
@@ -110,6 +118,8 @@ async def relay_chat_completions(
     except InvalidRequestError as error:
         return invalid_request_response(error.message)
 
+    observe_alias(alias)
+    observe_stream(streaming)
     routed_body = json.dumps(payload, allow_nan=False).encode("utf-8")
     breaker = breakers.get(alias)
     if breaker is None:
@@ -154,6 +164,7 @@ async def _relay_eligible(
     """폴백 대상 별칭 — 회로 차단기 판단에 따라 로컬을 시도하고, 폴백 대상 장애면 OpenAI로 우회한다."""
     attempt = breaker.begin()
     if attempt.decision is LocalDecision.skip:
+        observe_local_failure("circuit_open")
         return await _fallback(
             fallback,
             payload,
@@ -203,6 +214,7 @@ async def _relay_local_only(
 ) -> Response:
     """폴백 비대상 별칭 — 로컬로만 라우팅하고 장애 시 로컬 업스트림 오류를 돌려준다(OpenAI 미호출)."""
     if deadline.local_remaining_seconds() <= 0:
+        observe_local_failure("local_deadline")
         return response_start_timeout_response()
     outcome = await _attempt_local(
         local_client, streaming, routed_body, deadline, body_validator
@@ -250,6 +262,7 @@ async def _attempt_local(
     넘어가지 않는다. 폴백 대상 상태와 응답 없는 장애만 _LocalFailed로 남는다.
     """
     if deadline.local_remaining_seconds() <= 0:
+        observe_local_failure("local_deadline")
         return _LocalFailed()
     headers = JSON_HEADERS
     if streaming:
@@ -257,14 +270,17 @@ async def _attempt_local(
     request = local_client.build_request(
         "POST", CHAT_COMPLETIONS_PATH, content=routed_body, headers=headers
     )
+    observe_upstream_start()
     try:
         with anyio.fail_after(deadline.local_remaining_seconds()):
             response = await local_client.send(request, stream=True)
     except (httpx.RequestError, TimeoutError):
+        observe_local_failure("local_unreachable")
         return _LocalFailed()
 
     if is_fallback_status(response.status_code):
         await response.aclose()
+        observe_local_failure("local_error_status")
         return _LocalFailed()
     if not is_success_status(response.status_code):
         return _LocalServed(await _serve_confirmed_client_error(response, deadline))
@@ -286,7 +302,10 @@ async def _serve_confirmed_client_error(
         with anyio.fail_after(deadline.local_remaining_seconds()):
             body = await read_and_close_response(response)
     except Exception:
+        observe_local_failure("local_body_unreadable")
         return upstream_body_unavailable_response(response.status_code)
+    observe_provider("local")
+    observe_response_start()
     return Response(
         content=body,
         status_code=response.status_code,
@@ -307,9 +326,13 @@ async def _serve_local_buffered(
         with anyio.fail_after(deadline.local_remaining_seconds()):
             body = await read_and_close_response(response)
     except (httpx.RequestError, TimeoutError):
+        observe_local_failure("local_body_unreadable")
         return _LocalFailed()
     if not body_validator(body):
+        observe_local_failure("local_invalid_body")
         return _LocalFailed()
+    observe_provider("local")
+    observe_response_start()
     return _LocalServed(
         Response(
             content=body,
@@ -327,9 +350,13 @@ async def _commit_local_stream(
         with anyio.fail_after(deadline.local_remaining_seconds()):
             prefix = await secure_success_stream(response)
     except TimeoutError:
+        observe_local_failure("local_stream_timeout")
         return _LocalFailed()
     if prefix is None:
+        observe_local_failure("local_invalid_stream")
         return _LocalFailed()
+    observe_provider("local")
+    observe_response_start()
     return _LocalCommittedStream(prefix)
 
 
@@ -348,6 +375,7 @@ async def _stream_committed(
         breaker.record_success(attempt)
         cleanup.resolve()
     except httpx.RequestError:
+        observe_local_failure("local_stream_interrupted")
         breaker.record_failure(attempt)
         cleanup.resolve()
         raise

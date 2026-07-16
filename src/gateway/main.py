@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from time import monotonic
 
@@ -21,6 +22,7 @@ from gateway.middleware import (
     CacheControlMiddleware,
     RequestBodyLimitMiddleware,
 )
+from gateway.observability import ObservabilityMiddleware, RequestLogWriter
 from gateway.openai_fallback import OpenAIFallback
 from gateway.paths import API_KEY_STORE_PATH, PUBLIC_DOCS_PATH
 from gateway.public_docs import render_public_docs
@@ -38,43 +40,50 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     api_key_store = ApiKeyStore(app.state.api_key_store_path)
     api_key_store.validate()
     public_docs_html = render_public_docs(PUBLIC_DOCS_PATH)
+    # 요청 관측 로그도 기동 시 연다 — 디렉터리를 만들지 못하면 여기서 실패한다.
+    request_log = RequestLogWriter(settings.request_log_directory)
     timeout = httpx.Timeout(
         settings.upstream_read_timeout_seconds,
         connect=settings.upstream_connect_timeout_seconds,
     )
-    # chat·vision 로컬, 임베딩 전용 로컬, OpenAI 폴백 — 셋의 수명을 lifespan이 분리해 소유한다.
-    async with (
-        httpx.AsyncClient(
-            base_url=settings.ollama_base_url,
-            timeout=timeout,
-            trust_env=False,
-        ) as chat_client,
-        httpx.AsyncClient(
-            base_url=settings.embedding_ollama_base_url,
-            timeout=timeout,
-            trust_env=False,
-        ) as embedding_client,
-        httpx.AsyncClient(
-            base_url=settings.openai_base_url, timeout=timeout
-        ) as openai_client,
-    ):
-        app.state.chat_client = chat_client
-        app.state.embedding_client = embedding_client
-        app.state.routing = routing
-        app.state.api_key_store = api_key_store
-        app.state.public_docs_html = public_docs_html
-        app.state.fallback = OpenAIFallback(openai_client, settings.openai_api_key)
-        # 폴백 대상 별칭(chat, vision)마다 독립 회로 차단기를 둔다 — 폴백 자격의 유일한 출처.
-        # 여기에 없는 chat 별칭은 회로 차단기 없이 로컬로만 라우팅된다.
-        app.state.breakers = {
-            alias: CircuitBreaker(
-                settings.circuit_breaker_failure_threshold,
-                settings.circuit_breaker_open_seconds,
-                monotonic,
-            )
-            for alias in FALLBACK_ELIGIBLE_ALIASES
-        }
-        yield
+    try:
+        # chat·vision 로컬, 임베딩 전용 로컬, OpenAI 폴백 — 셋의 수명을 lifespan이 분리해 소유한다.
+        async with (
+            httpx.AsyncClient(
+                base_url=settings.ollama_base_url,
+                timeout=timeout,
+                trust_env=False,
+            ) as chat_client,
+            httpx.AsyncClient(
+                base_url=settings.embedding_ollama_base_url,
+                timeout=timeout,
+                trust_env=False,
+            ) as embedding_client,
+            httpx.AsyncClient(
+                base_url=settings.openai_base_url, timeout=timeout
+            ) as openai_client,
+        ):
+            app.state.chat_client = chat_client
+            app.state.embedding_client = embedding_client
+            app.state.routing = routing
+            app.state.api_key_store = api_key_store
+            app.state.public_docs_html = public_docs_html
+            app.state.request_log = request_log
+            app.state.fallback = OpenAIFallback(openai_client, settings.openai_api_key)
+            # 폴백 대상 별칭(chat, vision)마다 독립 회로 차단기를 둔다 — 폴백 자격의 유일한 출처.
+            # 여기에 없는 chat 별칭은 회로 차단기 없이 로컬로만 라우팅된다.
+            app.state.breakers = {
+                alias: CircuitBreaker(
+                    settings.circuit_breaker_failure_threshold,
+                    settings.circuit_breaker_open_seconds,
+                    monotonic,
+                    on_transition=partial(request_log.log_circuit_transition, alias),
+                )
+                for alias in FALLBACK_ELIGIBLE_ALIASES
+            }
+            yield
+    finally:
+        request_log.close()
 
 
 @router.get("/docs", response_class=HTMLResponse)
@@ -171,13 +180,17 @@ def create_app(api_key_store_path: Path = API_KEY_STORE_PATH) -> FastAPI:
     )
     app.state.api_key_store_path = api_key_store_path
     app.include_router(router)
-    # 등록 역순으로 감싸지므로 최종 순서는 Cache-Control -> 인증 -> 본문 제한 -> 라우트다.
-    # 이에 인증 실패는 request body receive를 한 번도 호출하지 않고 끝난다.
+    # 등록 역순으로 감싸지므로 최종 순서는 관측 -> Cache-Control -> 인증 -> 본문 제한 -> 라우트다.
+    # 이에 인증 실패는 request body receive를 한 번도 호출하지 않고 끝나며, 관측은 가장 바깥에서
+    # 도착 시각의 유일한 기준점을 만들고 인증 실패를 포함한 모든 응답을 기록한다.
     app.add_middleware(RequestBodyLimitMiddleware)
     app.add_middleware(
         AuthenticationMiddleware, store_provider=lambda: app.state.api_key_store
     )
     app.add_middleware(CacheControlMiddleware)
+    app.add_middleware(
+        ObservabilityMiddleware, writer_provider=lambda: app.state.request_log
+    )
     return app
 
 

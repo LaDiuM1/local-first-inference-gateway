@@ -151,7 +151,7 @@ async def test_relay_passes_non_fallback_error_through(
 
 
 @respx.mock
-async def test_relay_drops_hop_by_hop_headers(
+async def test_relay_drops_hop_by_hop_and_gateway_owned_headers(
     gateway_client: httpx.AsyncClient,
 ) -> None:
     respx.post(UPSTREAM_URL).respond(
@@ -161,7 +161,7 @@ async def test_relay_drops_hop_by_hop_headers(
             "connection": " X-Internal , keep-alive ",
             "transfer-encoding": "chunked",
             "x-internal": "must-not-leak",
-            "x-request-id": "abc",
+            "x-request-id": "upstream-request-id",
         },
     )
 
@@ -170,7 +170,9 @@ async def test_relay_drops_hop_by_hop_headers(
     assert "transfer-encoding" not in response.headers
     assert "connection" not in response.headers
     assert "x-internal" not in response.headers
-    assert response.headers["x-request-id"] == "abc"
+    # 요청 식별자는 게이트웨이 소유다 — 업스트림 값은 버리고 게이트웨이 발급 값 하나만 나간다.
+    assert response.headers.get_list("x-request-id") != ["upstream-request-id"]
+    assert len(response.headers.get_list("x-request-id")) == 1
 
 
 SSE_CHUNKS = [

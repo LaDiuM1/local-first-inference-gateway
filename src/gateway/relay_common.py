@@ -29,14 +29,18 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+# 요청 식별자는 게이트웨이가 경계에서 발급해 응답에 싣는다 — provider의 값이 섞여 나가면
+# 클라이언트가 어느 기록과 대조할지 모호해지므로 업스트림 x-request-id는 중계하지 않는다.
+GATEWAY_OWNED_HEADERS = {"x-request-id"}
 # 버퍼링 경로는 디코딩된 본문을 반환하므로 길이·인코딩을 재계산에 맡기고,
 # 스트리밍 경로는 HTTP 전송 인코딩을 명시적으로 푼 뒤 SSE 바이트를 흘리므로 길이·인코딩 헤더를
 # 재계산에 맡긴다.
-EXCLUDED_BUFFERED_HEADERS = HOP_BY_HOP_HEADERS | {"content-length", "content-encoding"}
-EXCLUDED_STREAMING_HEADERS = HOP_BY_HOP_HEADERS | {
-    "content-length",
-    "content-encoding",
-}
+EXCLUDED_BUFFERED_HEADERS = (
+    HOP_BY_HOP_HEADERS | GATEWAY_OWNED_HEADERS | {"content-length", "content-encoding"}
+)
+EXCLUDED_STREAMING_HEADERS = (
+    HOP_BY_HOP_HEADERS | GATEWAY_OWNED_HEADERS | {"content-length", "content-encoding"}
+)
 
 REASONING_EFFORT_FIELD = "reasoning_effort"
 # 로컬 일반 모드 — reasoning_effort 생략 시 게이트웨이가 넣는 기본값.

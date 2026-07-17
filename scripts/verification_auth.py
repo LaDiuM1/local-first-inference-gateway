@@ -6,6 +6,8 @@
 """
 
 import os
+import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -57,4 +59,17 @@ class VerificationAuth:
         environment["PYTHONPATH"] = scripts_directory
 
     def close(self) -> None:
-        self._directory.cleanup()
+        """임시 저장소를 정리한다 — 검증 결과에는 영향이 없다.
+
+        Windows는 게이트웨이 프로세스 종료 직후 관측 로그 파일 핸들을 늦게 놓아
+        삭제가 WinError 32로 경합할 수 있다. 짧게 재시도하고, 끝내 남으면 임시
+        디렉터리를 그대로 두고 넘어간다 — 정리 실패로 검증·측정을 깨뜨리지 않는다.
+        """
+        for _ in range(10):
+            try:
+                self._directory.cleanup()
+                return
+            except PermissionError:
+                time.sleep(0.3)
+        with suppress(PermissionError):
+            self._directory.cleanup()

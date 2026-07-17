@@ -108,6 +108,16 @@ def is_success_status(status_code: int) -> bool:
     return 200 <= status_code < 300
 
 
+def is_relayable_error_status(status_code: int) -> bool:
+    """업스트림 오류 응답(4xx·5xx)을 본문 그대로 전달할 수 있는 상태인지 본다.
+
+    성공(2xx)도 아니고 여기에도 속하지 않는 1xx·3xx와 비표준 600 이상은 추론 응답이 될 수
+    없는 무효 상태다 — 로컬이면 폴백 대상, OpenAI·임베딩이면 비밀 없는 502 합성으로 각
+    경계가 처리한다.
+    """
+    return 400 <= status_code < 600
+
+
 # 2xx 버퍼 본문의 유효성 판정 — 기본은 Chat Completions 최소 계약이고, Responses처럼 더 엄격한
 # 변환 조건이 필요한 경계는 자기 기준의 판정 함수를 중계 경로에 주입한다.
 BodyValidator = Callable[[bytes], bool]
@@ -339,14 +349,105 @@ async def secure_success_stream(response: httpx.Response) -> StreamPrefix | None
             return None
 
 
+class StreamTruncatedError(Exception):
+    """업스트림 SSE 스트림이 [DONE] 종료 이벤트 없이 정상 EOF로 끝났다 — 잘린 응답이다."""
+
+
+class SseDoneTracker:
+    """커밋 후 중계되는 SSE 바이트에서 종료 이벤트(`data: [DONE]`)의 완결을 관찰한다.
+
+    Chat Completions 스트림은 [DONE] 이벤트로 끝나는 것이 계약이므로, 이를 보지 못한 EOF는
+    전송 장애와 같은 잘린 응답이다. 중계 바이트는 검사만 하고 소유하지 않으며, 미완결 라인과
+    진행 중 이벤트의 data만 들고 간다. 라인 판정은 커밋 전 검사(`_classify_sse_prefix`)와 같은
+    규칙을 따르되, 소비한 바이트를 버리므로 청크 경계에 걸린 CRLF는 플래그로 이어 붙인다.
+    """
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+        self._event_data: list[bytes] = []
+        # 이벤트 누적량은 증분으로 센다 — 매 청크마다 목록을 재합산하지 않고, 값이
+        # 빈 data 라인도 라인당 1로 계상해 무한 축적을 상한에 걸리게 한다.
+        self._event_bytes = 0
+        self._event_open = False
+        self._skip_leading_lf = False
+        self.done_seen = False
+
+    def feed(self, chunk: bytes) -> None:
+        if self.done_seen or not chunk:
+            return
+        if self._skip_leading_lf:
+            self._skip_leading_lf = False
+            if chunk[0] == _SSE_LF:
+                chunk = chunk[1:]
+                if not chunk:
+                    return
+        # 유지 중인 미완결 라인에는 종결자가 없음이 보장된다 — 새 청크에도 없으면
+        # 누적만 하고 재스캔하지 않는다(개행 없는 스트림의 반복 전체 스캔 방지).
+        self._pending.extend(chunk)
+        if b"\n" not in chunk and b"\r" not in chunk:
+            self._enforce_tracking_limit()
+            return
+        start = 0
+        while not self.done_seen:
+            completed = _next_sse_line(self._pending, start)
+            if completed is None:
+                break
+            line, start = completed
+            self._track_line(line)
+        # 버퍼 끝의 단독 CR로 라인을 닫았다면 다음 청크 선두의 LF는 같은 CRLF의 나머지다.
+        self._skip_leading_lf = (
+            0 < start == len(self._pending) and self._pending[start - 1] == _SSE_CR
+        )
+        del self._pending[:start]
+        self._enforce_tracking_limit()
+
+    def _enforce_tracking_limit(self) -> None:
+        # 정상 Chat Completions 이벤트는 검사 상한보다 훨씬 작다 — 상한을 넘는 미완결
+        # 라인·이벤트는 프로토콜 위반이므로 무한 보관 대신 잘린 스트림으로 끝낸다.
+        if len(self._pending) + self._event_bytes > MAX_PRECOMMIT_INSPECTION_BYTES:
+            raise StreamTruncatedError("SSE event exceeds the inspection bound")
+
+    def require_done(self) -> None:
+        if not self.done_seen:
+            raise StreamTruncatedError("stream ended without the [DONE] terminal event")
+
+    def _track_line(self, line: bytes | bytearray) -> None:
+        if not line:
+            if not self._event_open:
+                return
+            payload = b"\n".join(self._event_data)
+            self._event_data.clear()
+            self._event_bytes = 0
+            self._event_open = False
+            if payload.strip() == _SSE_DONE_MARKER:
+                self.done_seen = True
+            return
+        if line.startswith(_SSE_COMMENT_PREFIX):
+            return
+        field, _, value = line.partition(b":")
+        if field == _SSE_DATA_FIELD:
+            self._event_open = True
+            part = value.lstrip(b" ")
+            self._event_data.append(part)
+            self._event_bytes += len(part) + 1
+
+
 async def iter_committed_stream(
     prefix: StreamPrefix, cleanup: StreamCleanup
 ) -> AsyncIterator[bytes]:
-    """확정된 스트림을 원문 바이트 그대로 흘리고, 성공·실패·취소 어느 경로로 끝나도 응답을 닫는다."""
+    """확정된 스트림을 원문 바이트 그대로 흘리고, 성공·실패·취소 어느 경로로 끝나도 응답을 닫는다.
+
+    [DONE] 종료 이벤트 없이 끝난 정상 EOF는 잘린 응답이다 — 이미 중계한 바이트는 그대로 두고
+    마지막 정상 종료 없이 예외로 끝내 클라이언트가 불완전 전송을 감지하게 한다.
+    """
+    tracker = SseDoneTracker()
     try:
         for chunk in prefix.initial_chunks:
+            tracker.feed(chunk)
             yield chunk
         async for chunk in prefix.remaining:
+            tracker.feed(chunk)
             yield chunk
+        tracker.require_done()
     finally:
         await cleanup.close()

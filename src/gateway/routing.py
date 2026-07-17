@@ -111,8 +111,9 @@ def _parse_route(entry: object, index: int) -> Route:
 
 
 def _require_config_str(entry: dict, field: str, index: int) -> str:
+    # 공백뿐인 문자열은 빈 값과 같다 — 런타임으로 미루지 않고 기동 시점에 실패시킨다.
     value = entry.get(field)
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value.strip():
         raise RoutingConfigError(
             f"routes[{index}]에 비어 있지 않은 {field} 문자열이 필요하다"
         )

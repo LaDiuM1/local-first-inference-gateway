@@ -246,6 +246,11 @@ def _responses_success(
             "incomplete_details": incomplete_details,
             "instructions": instructions,
             "model": requested_model,
+            # 도구 기능은 지원 범위 밖이지만 공식 응답 객체의 필수 필드다 — 엄격
+            # 검증을 켠 OpenAI SDK가 응답을 거절하지 않도록 기본값을 채운다.
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
             "output": [
                 {
                     "id": message_id,

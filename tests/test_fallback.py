@@ -136,6 +136,41 @@ async def test_local_success_does_not_call_openai(
     assert not openai.called
 
 
+@respx.mock
+async def test_local_redirect_status_switches_to_openai_without_location_leak(
+    fallback_client: httpx.AsyncClient,
+) -> None:
+    # 1xx·3xx는 유효한 추론 응답도 전달 대상 오류도 아니다 — 폴백 대상 무효 응답이다.
+    local = respx.post(LOCAL_URL).respond(
+        302, headers={"Location": "http://127.0.0.1:11434/internal"}
+    )
+    openai = respx.post(OPENAI_URL).respond(200, json={"id": "openai", "choices": []})
+
+    response = await fallback_client.post("/v1/chat/completions", json=CHAT_REQUEST)
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "openai"
+    assert local.called
+    assert openai.called
+    assert "location" not in response.headers
+
+
+@respx.mock
+async def test_openai_redirect_status_is_secretless_502(
+    fallback_client: httpx.AsyncClient,
+) -> None:
+    respx.post(LOCAL_URL).respond(503, json={"error": "down"})
+    respx.post(OPENAI_URL).respond(
+        302, headers={"Location": "https://api.openai.com/private"}
+    )
+
+    response = await fallback_client.post("/v1/chat/completions", json=CHAT_REQUEST)
+
+    assert response.status_code == 502
+    assert "location" not in response.headers
+    assert TEST_KEY not in response.text
+
+
 # --- 폴백 대상 장애는 즉시 OpenAI로 우회한다 ---
 
 

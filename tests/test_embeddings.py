@@ -389,7 +389,7 @@ async def test_embed_wraps_upstream_error_as_openai_format(
     assert error["message"] == "model not found"
 
 
-@pytest.mark.parametrize("status_code", [201, 202, 204, 206, 299])
+@pytest.mark.parametrize("status_code", [201, 202, 204, 206, 299, 302, 601])
 @respx.mock
 async def test_embed_non_200_success_status_becomes_502_without_openai(
     gateway_client: httpx.AsyncClient, status_code: int

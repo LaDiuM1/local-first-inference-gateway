@@ -13,6 +13,7 @@ import pytest
 import respx
 from asgi_lifespan import LifespanManager
 from pydantic import SecretStr
+from starlette.requests import ClientDisconnect
 from starlette.types import Message, Receive, Scope, Send
 
 from gateway.config import settings
@@ -264,6 +265,32 @@ async def test_body_send_failure_is_not_counted_as_completed() -> None:
     [record] = writer.records
     assert record["status"] == 200
     assert record["bytes_out"] == 0
+    assert record["completed"] is False
+
+
+async def test_client_disconnect_during_body_read_logs_without_500() -> None:
+    """본문 수신 중 클라이언트 연결 종료는 내부 오류가 아니다 — 500 합성 없이 미완결로 남긴다."""
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        raise ClientDisconnect()
+
+    async def receive() -> Message:
+        return {"type": "http.request"}
+
+    sent: list[Message] = []
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    writer = _RecordingWriter()
+    middleware = ObservabilityMiddleware(app, writer_provider=lambda: writer)
+    scope: Scope = {"type": "http", "method": "POST", "path": "/v1/chat/completions"}
+
+    await middleware(scope, receive, send)
+
+    assert sent == []
+    [record] = writer.records
+    assert record["status"] is None
     assert record["completed"] is False
 
 

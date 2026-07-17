@@ -13,11 +13,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic, sleep
 
 from gateway.file_io import atomic_write
 
 STORE_VERSION = 1
 API_KEY_PREFIX = "sk-oat-"
+# 잠금 획득 상한 — CLI의 발급·폐기가 잡는 짧은 잠금은 충분히 기다리고, 멈춘
+# 파일시스템은 무한 대기 대신 저장소 불가(503)로 끝낸다.
+LOCK_TIMEOUT_SECONDS = 5.0
+LOCK_RETRY_INTERVAL_SECONDS = 0.05
 _KEY_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 _KEY_PATTERN = re.compile(r"^sk-oat-([0-9a-f]{16})\.([A-Za-z0-9_-]{43})$")
 _DUMMY_SALT = hashlib.sha256(b"openat-invalid-api-key-salt").digest()[:16]
@@ -170,8 +175,12 @@ class ApiKeyStore:
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
+        # 잠금 대기에 상한을 둔다 — 저장소가 멈춰도 인증 요청이 무한 대기로 워커를
+        # 붙들지 않고 fail-closed(503)로 끝난다.
         process_lock = _process_lock_for(self._lock_path)
-        with process_lock:
+        if not process_lock.acquire(timeout=LOCK_TIMEOUT_SECONDS):
+            raise ApiKeyStoreError("API key store lock is unavailable")
+        try:
             try:
                 self._lock_path.parent.mkdir(parents=True, exist_ok=True)
                 with self._lock_path.open("a+b") as handle:
@@ -189,6 +198,8 @@ class ApiKeyStore:
                 raise
             except OSError as error:
                 raise ApiKeyStoreError("API key store lock is unavailable") from error
+        finally:
+            process_lock.release()
 
 
 def _process_lock_for(path: Path) -> threading.RLock:
@@ -197,14 +208,29 @@ def _process_lock_for(path: Path) -> threading.RLock:
 
 
 def _lock_file(handle: object) -> None:
+    """파일 잠금을 상한 안에서 획득한다 — 비차단 시도를 반복하고 초과 시 OSError."""
+    deadline = monotonic() + LOCK_TIMEOUT_SECONDS
     if os.name == "nt":
         import msvcrt
 
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        return
+        while True:
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if monotonic() >= deadline:
+                    raise
+                sleep(LOCK_RETRY_INTERVAL_SECONDS)
     import fcntl
 
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if monotonic() >= deadline:
+                raise
+            sleep(LOCK_RETRY_INTERVAL_SECONDS)
 
 
 def _unlock_file(handle: object) -> None:

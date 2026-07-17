@@ -18,6 +18,7 @@ from gateway.relay_common import (
     ManagedStreamingResponse,
     StreamCleanup,
     StreamPrefix,
+    StreamTruncatedError,
     is_valid_chat_completion_body,
     iter_committed_stream,
     secure_success_stream,
@@ -326,26 +327,113 @@ async def test_secure_stream_exceeds_inspection_bound_returns_none() -> None:
 # --- 확정 스트림 자원 정리 ---
 
 
+FIRST_EVENT = b'data: {"choices":[{"index":0,"delta":{"content":"a"}}]}\n\n'
+NEXT_EVENT = b'data: {"choices":[{"index":0,"delta":{"content":"b"}}]}\n\n'
+
+
 @pytest.mark.anyio
 async def test_iter_committed_stream_relays_and_closes_on_success() -> None:
     response = FakeResponse()
-    prefix = StreamPrefix(response, (b"a",), 1, _achunks([b"b", b"c"]))
+    prefix = StreamPrefix(
+        response, (FIRST_EVENT,), 1, _achunks([NEXT_EVENT, DONE_EVENT])
+    )
     cleanup = StreamCleanup(response)
 
     out = [chunk async for chunk in iter_committed_stream(prefix, cleanup)]
 
-    assert out == [b"a", b"b", b"c"]
+    assert out == [FIRST_EVENT, NEXT_EVENT, DONE_EVENT]
+    assert response.closed
+
+
+@pytest.mark.anyio
+async def test_iter_committed_stream_accepts_done_split_across_chunks() -> None:
+    response = FakeResponse()
+    prefix = StreamPrefix(
+        response, (FIRST_EVENT,), 1, _achunks([b"data: [DO", b"NE]\n", b"\n"])
+    )
+    cleanup = StreamCleanup(response)
+
+    out = [chunk async for chunk in iter_committed_stream(prefix, cleanup)]
+
+    assert b"".join(out) == FIRST_EVENT + DONE_EVENT
+    assert response.closed
+
+
+@pytest.mark.anyio
+async def test_iter_committed_stream_accumulates_lineless_chunks_without_rescan() -> (
+    None
+):
+    # 개행 없는 청크는 누적만 한다 — 상한 안에서는 오류 없이 통과하고 [DONE]으로 끝난다.
+    response = FakeResponse()
+    lineless = [b"data: " + b"x" * 1024] * 32 + [b"\n\n", DONE_EVENT]
+    prefix = StreamPrefix(response, (VALID_EVENT,), 1, _achunks(lineless))
+    cleanup = StreamCleanup(response)
+
+    out = [chunk async for chunk in iter_committed_stream(prefix, cleanup)]
+
+    assert b"".join(out).endswith(DONE_EVENT)
+    assert response.closed
+
+
+@pytest.mark.anyio
+async def test_iter_committed_stream_bounds_empty_data_line_flood() -> None:
+    # 값이 빈 `data:` 라인만 무한히 이어지는 이벤트도 상한에 걸려야 한다 —
+    # 바이트 길이만 세면 목록 축적과 재합산이 상한을 우회한다.
+    response = FakeResponse()
+    flood = [b"data:\n" * 8192 for _ in range(9)]
+    prefix = StreamPrefix(response, (VALID_EVENT,), 1, _achunks(flood))
+    cleanup = StreamCleanup(response)
+    generator = iter_committed_stream(prefix, cleanup)
+
+    with pytest.raises(StreamTruncatedError):
+        async for _ in generator:
+            pass
+
+    assert response.closed
+
+
+@pytest.mark.anyio
+async def test_iter_committed_stream_bounds_unterminated_line_growth() -> None:
+    # 종결자 없는 라인이 검사 상한을 넘으면 무한 보관 대신 잘린 스트림으로 끝낸다.
+    response = FakeResponse()
+    oversized = [b"x" * 8192 for _ in range(9)]
+    prefix = StreamPrefix(response, (VALID_EVENT,), 1, _achunks(oversized))
+    cleanup = StreamCleanup(response)
+    generator = iter_committed_stream(prefix, cleanup)
+
+    with pytest.raises(StreamTruncatedError):
+        async for _ in generator:
+            pass
+
+    assert response.closed
+
+
+@pytest.mark.anyio
+async def test_iter_committed_stream_raises_on_eof_without_done() -> None:
+    response = FakeResponse()
+    prefix = StreamPrefix(response, (FIRST_EVENT,), 1, _achunks([NEXT_EVENT]))
+    cleanup = StreamCleanup(response)
+    generator = iter_committed_stream(prefix, cleanup)
+
+    assert await generator.__anext__() == FIRST_EVENT
+    assert await generator.__anext__() == NEXT_EVENT
+    # [DONE] 없는 정상 EOF는 잘린 응답이다 — 정상 종료로 위장하지 않는다.
+    with pytest.raises(StreamTruncatedError):
+        await generator.__anext__()
+
     assert response.closed
 
 
 @pytest.mark.anyio
 async def test_iter_committed_stream_closes_on_cancellation() -> None:
     response = FakeResponse()
-    prefix = StreamPrefix(response, (b"a",), 1, _achunks([b"b", b"c"]))
+    prefix = StreamPrefix(
+        response, (FIRST_EVENT,), 1, _achunks([NEXT_EVENT, DONE_EVENT])
+    )
     cleanup = StreamCleanup(response)
     generator = iter_committed_stream(prefix, cleanup)
 
-    assert await generator.__anext__() == b"a"
+    assert await generator.__anext__() == FIRST_EVENT
     await generator.aclose()
 
     assert response.closed
@@ -355,15 +443,33 @@ async def test_iter_committed_stream_closes_on_cancellation() -> None:
 async def test_stream_committed_records_success_and_closes() -> None:
     response = FakeResponse()
     breaker = FakeBreaker()
-    prefix = StreamPrefix(response, (b"a",), 1, _achunks([b"b"]))
+    prefix = StreamPrefix(response, (FIRST_EVENT,), 1, _achunks([DONE_EVENT]))
     cleanup = StreamCleanup(response, lambda: breaker.release(ATTEMPT))
 
     out = [
         chunk async for chunk in _stream_committed(prefix, breaker, ATTEMPT, cleanup)
     ]
 
-    assert out == [b"a", b"b"]
+    assert out == [FIRST_EVENT, DONE_EVENT]
     assert breaker.calls == ["success"]
+    assert response.closed
+
+
+@pytest.mark.anyio
+async def test_stream_committed_records_failure_on_eof_without_done() -> None:
+    response = FakeResponse()
+    breaker = FakeBreaker()
+    prefix = StreamPrefix(response, (FIRST_EVENT,), 1, _achunks([NEXT_EVENT]))
+    cleanup = StreamCleanup(response, lambda: breaker.release(ATTEMPT))
+    generator = _stream_committed(prefix, breaker, ATTEMPT, cleanup)
+
+    assert await generator.__anext__() == FIRST_EVENT
+    assert await generator.__anext__() == NEXT_EVENT
+    with pytest.raises(StreamTruncatedError):
+        await generator.__anext__()
+
+    # [DONE] 없는 EOF는 로컬 실패다 — 회로에 실패를 기록하고 예외로 끝낸다.
+    assert breaker.calls == ["failure"]
     assert response.closed
 
 
@@ -407,14 +513,14 @@ async def test_stream_committed_releases_on_cancellation() -> None:
 async def test_half_open_committed_success_closes_breaker() -> None:
     response = FakeResponse()
     breaker, probe = _half_open_probe()
-    prefix = StreamPrefix(response, (b"a",), 1, _achunks([b"b"]))
+    prefix = StreamPrefix(response, (FIRST_EVENT,), 1, _achunks([DONE_EVENT]))
     cleanup = StreamCleanup(response, lambda: breaker.release(probe))
 
     assert [
         chunk async for chunk in _stream_committed(prefix, breaker, probe, cleanup)
     ] == [
-        b"a",
-        b"b",
+        FIRST_EVENT,
+        DONE_EVENT,
     ]
 
     assert breaker.begin().decision is LocalDecision.attempt

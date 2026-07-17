@@ -49,9 +49,12 @@ from gateway.relay_common import (
     REASONING_EFFORT_FIELD,
     BodyValidator,
     ManagedStreamingResponse,
+    SseDoneTracker,
     StreamCleanup,
     StreamPrefix,
+    StreamTruncatedError,
     is_fallback_status,
+    is_relayable_error_status,
     is_success_status,
     is_valid_chat_completion_body,
     iter_committed_stream,
@@ -92,7 +95,12 @@ class _LocalFailed:
     """로컬이 유효한 추론 응답을 못 줬다 — 폴백 대상(연결 실패·429·5xx·404·빈/무효 응답)."""
 
 
-_LocalOutcome = _LocalServed | _LocalCommittedStream | _LocalFailed
+@dataclass(frozen=True)
+class _LocalNotAttempted:
+    """로컬 기한이 호출 전에 소진됐다 — 로컬 결함이 아니므로 회로에 실패를 기록하지 않는다."""
+
+
+_LocalOutcome = _LocalServed | _LocalCommittedStream | _LocalFailed | _LocalNotAttempted
 
 
 async def relay_chat_completions(
@@ -172,6 +180,18 @@ async def _relay_eligible(
             deadline.total_remaining_seconds(),
             body_validator,
         )
+    if deadline.local_remaining_seconds() <= 0:
+        # 본문 수신 등으로 로컬 기한이 이미 소진된 요청 — 로컬 결함이 아니므로 회로에 실패를
+        # 기록하지 않고 슬롯만 되돌린 뒤 전체 기한의 잔여로 폴백한다.
+        observe_local_failure("local_deadline")
+        breaker.release(attempt)
+        return await _fallback(
+            fallback,
+            payload,
+            streaming,
+            deadline.total_remaining_seconds(),
+            body_validator,
+        )
     try:
         outcome = await _attempt_local(
             local_client, streaming, routed_body, deadline, body_validator
@@ -195,7 +215,11 @@ async def _relay_eligible(
                 outcome.prefix.response, EXCLUDED_STREAMING_HEADERS
             ),
         )
-    breaker.record_failure(attempt)
+    if isinstance(outcome, _LocalNotAttempted):
+        # 사전 검사와 호출 사이에 기한이 끝난 경쟁 경로 — 미시도이므로 슬롯만 되돌린다.
+        breaker.release(attempt)
+    else:
+        breaker.record_failure(attempt)
     return await _fallback(
         fallback,
         payload,
@@ -259,11 +283,11 @@ async def _attempt_local(
 
     buffered·streaming 모두 응답 헤더까지만 먼저 받는다. 상태 코드를 확보한 순간 폴백 대상 아닌
     4xx는 로컬이 확정한 클라이언트 오류가 되므로, 이후 본문 읽기가 어떻게 실패하든 OpenAI로
-    넘어가지 않는다. 폴백 대상 상태와 응답 없는 장애만 _LocalFailed로 남는다.
+    넘어가지 않는다. 폴백 대상 상태와 1xx·3xx 무효 상태, 응답 없는 장애만 _LocalFailed로 남는다.
     """
     if deadline.local_remaining_seconds() <= 0:
         observe_local_failure("local_deadline")
-        return _LocalFailed()
+        return _LocalNotAttempted()
     headers = JSON_HEADERS
     if streaming:
         headers = STREAMING_JSON_HEADERS
@@ -283,6 +307,11 @@ async def _attempt_local(
         observe_local_failure("local_error_status")
         return _LocalFailed()
     if not is_success_status(response.status_code):
+        if not is_relayable_error_status(response.status_code):
+            # 1xx·3xx — 유효한 추론 응답도 전달 대상 오류도 아닌 무효 응답이므로 폴백 대상이다.
+            await response.aclose()
+            observe_local_failure("local_invalid_status")
+            return _LocalFailed()
         return _LocalServed(await _serve_confirmed_client_error(response, deadline))
     if streaming:
         return await _commit_local_stream(response, deadline)
@@ -366,15 +395,23 @@ async def _stream_committed(
     attempt: LocalAttempt,
     cleanup: StreamCleanup,
 ) -> AsyncIterator[bytes]:
-    """확정된 로컬 스트림을 흘린다. 중간 장애는 스트림을 끊고 실패로 기록하되 provider를 섞지 않는다."""
+    """확정된 로컬 스트림을 흘린다. 중간 장애와 [DONE] 없는 EOF는 실패로 기록하고 예외 종료한다.
+
+    이미 중계한 바이트는 그대로 두고 provider를 섞지 않는다 — 잘린 스트림을 정상 완료로
+    위장하지 않고 예외로 끝내 클라이언트가 불완전 전송을 감지하게 한다.
+    """
+    tracker = SseDoneTracker()
     try:
         for chunk in prefix.initial_chunks:
+            tracker.feed(chunk)
             yield chunk
         async for chunk in prefix.remaining:
+            tracker.feed(chunk)
             yield chunk
+        tracker.require_done()
         breaker.record_success(attempt)
         cleanup.resolve()
-    except httpx.RequestError:
+    except (httpx.RequestError, StreamTruncatedError):
         observe_local_failure("local_stream_interrupted")
         breaker.record_failure(attempt)
         cleanup.resolve()

@@ -3,7 +3,8 @@
 검증 기준(docs/ROADMAP.md 2단계):
 - OpenAI SDK를 사용하는 클라이언트에서 Base URL만 변경하여 요청 성공 확인
 
-실행 전제: Ollama 기동 상태(gemma4:12b-it-qat 사용 가능). 게이트웨이는 스크립트가 직접 띄운다.
+실행 전제: Ollama 기동 상태(gemma4:12b-it-qat 사용 가능). 게이트웨이는 스크립트가 직접 띄우며
+실 OpenAI 폴백은 비활성화한다.
 실행: uv run python scripts/verify_stage2.py
 """
 
@@ -32,6 +33,7 @@ def free_port() -> int:
 GATEWAY_PORT = free_port()
 GATEWAY_BASE_URL = f"http://{GATEWAY_HOST}:{GATEWAY_PORT}"
 CHAT_ALIAS = "chat"
+CHAT_MODEL = "gemma4:12b-it-qat"
 STARTUP_TIMEOUT_SECONDS = 15
 REQUEST_TIMEOUT_SECONDS = 120
 
@@ -50,6 +52,8 @@ def check(label: str, passed: bool, detail: str) -> None:
 
 def start_gateway() -> subprocess.Popen:
     environment = os.environ.copy()
+    # 라이브 검증은 로컬 Ollama만 대상으로 한다. 저장소 .env에 키가 있어도 외부로 우회하지 않는다.
+    environment["OPENAI_API_KEY"] = ""
     AUTH.apply_to(environment)
     process = subprocess.Popen(
         [
@@ -102,6 +106,11 @@ try:
         "SDK 챗 응답 수신",
         bool(answer.strip()),
         f"model={completion.model}, {len(answer)}자 응답",
+    )
+    check(
+        "응답 model 로컬 모델 일치",
+        completion.model == CHAT_MODEL,
+        f"model={completion.model}",
     )
 
     usage_total = 0

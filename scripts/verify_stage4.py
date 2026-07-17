@@ -5,7 +5,7 @@
 - 임베딩 API 호출 및 결과 반환 성공
 
 확인 항목:
-- chat 별칭 → 실제 모델 치환으로 챗 응답 수신
+- chat 별칭 → 실제 모델 치환으로 챗 응답 수신, 스트림 청크 model이 설정 모델과 일치
 - 사고 모드 — reasoning_effort 생략(기본 일반 모드)은 사고 출력이 없고, reasoning_effort:high면 사고 출력이 생긴다
 - 제어 계약 — 비문자열·빈 문자열 reasoning_effort는 업스트림 호출 없이 400
 - 엄격한 별칭 계약 — 실제 모델명·미등록 별칭·엔드포인트 불일치 별칭은 업스트림 호출 없이 400
@@ -121,8 +121,8 @@ def start_gateway() -> subprocess.Popen:
 
 def stream_reasoning_and_content(
     client: openai.OpenAI, reasoning_effort: str | None
-) -> tuple[str, int]:
-    """스트림에서 content와 reasoning 델타 개수를 모은다 — 사고 모드 동작을 관찰한다."""
+) -> tuple[str, int, set[str]]:
+    """스트림에서 content·reasoning 델타와 청크 model 값을 모은다 — 사고 모드와 라우팅을 관찰한다."""
     extra: dict[str, object] = {}
     if reasoning_effort is not None:
         extra["reasoning_effort"] = reasoning_effort
@@ -140,7 +140,9 @@ def stream_reasoning_and_content(
     )
     content = ""
     reasoning_deltas = 0
+    chunk_models: set[str] = set()
     for chunk in stream:
+        chunk_models.add(chunk.model)
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -148,7 +150,7 @@ def stream_reasoning_and_content(
             content += delta.content
         if getattr(delta, "reasoning", None):
             reasoning_deltas += 1
-    return content, reasoning_deltas
+    return content, reasoning_deltas, chunk_models
 
 
 def chat_body(model: str, **extra: object) -> dict:
@@ -176,11 +178,18 @@ try:
     )
 
     # 1. 기본 일반 모드 — reasoning_effort 생략 시 게이트웨이가 none을 넣어 사고 출력이 없다.
-    content, default_reasoning_deltas = stream_reasoning_and_content(client, None)
+    content, default_reasoning_deltas, stream_models = stream_reasoning_and_content(
+        client, None
+    )
     check(
         "chat 별칭 챗 응답",
         bool(content.strip()),
         f"content {len(content)}자",
+    )
+    check(
+        "스트림 model 로컬 모델 일치",
+        stream_models == {CHAT_MODEL},
+        f"수신 model {sorted(stream_models)}",
     )
     check(
         "기본 일반 모드(사고 없음)",
@@ -189,7 +198,7 @@ try:
     )
 
     # 2. reasoning_effort:high — SDK 정식 인자를 그대로 업스트림에 전달해 사고 출력이 생긴다.
-    _, thinking_reasoning_deltas = stream_reasoning_and_content(client, "high")
+    _, thinking_reasoning_deltas, _ = stream_reasoning_and_content(client, "high")
     check(
         "reasoning_effort:high 사고 모드",
         thinking_reasoning_deltas > 0,

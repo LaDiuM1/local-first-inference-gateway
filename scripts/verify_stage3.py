@@ -4,7 +4,8 @@
 - 클라이언트에서 응답을 토큰 단위로 순차 수신하는지 확인
   (기본이 일반 모드라 사고 델타 없이 content 델타가 시간축에 분산되는지로 검증)
 
-실행 전제: Ollama 기동 상태(gemma4:12b-it-qat 사용 가능). 게이트웨이는 스크립트가 직접 띄운다.
+실행 전제: Ollama 기동 상태(gemma4:12b-it-qat 사용 가능). 게이트웨이는 스크립트가 직접 띄우며
+실 OpenAI 폴백은 비활성화한다.
 실행: uv run python scripts/verify_stage3.py
 """
 
@@ -33,6 +34,7 @@ def free_port() -> int:
 GATEWAY_PORT = free_port()
 GATEWAY_BASE_URL = f"http://{GATEWAY_HOST}:{GATEWAY_PORT}"
 CHAT_ALIAS = "chat"
+CHAT_MODEL = "gemma4:12b-it-qat"
 STARTUP_TIMEOUT_SECONDS = 15
 REQUEST_TIMEOUT_SECONDS = 180
 
@@ -51,6 +53,8 @@ def check(label: str, passed: bool, detail: str) -> None:
 
 def start_gateway() -> subprocess.Popen:
     environment = os.environ.copy()
+    # 라이브 검증은 로컬 Ollama만 대상으로 한다. 저장소 .env에 키가 있어도 외부로 우회하지 않는다.
+    environment["OPENAI_API_KEY"] = ""
     AUTH.apply_to(environment)
     process = subprocess.Popen(
         [
@@ -102,8 +106,10 @@ try:
 
     delta_seconds: list[float] = []
     content = ""
+    chunk_models: set[str] = set()
     for chunk in stream:
         elapsed = time.perf_counter() - started
+        chunk_models.add(chunk.model)
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -127,6 +133,12 @@ try:
             spread > last * 0.5,
             f"첫 델타 {first:.2f}s, 마지막 {last:.2f}s — 수신 구간 {spread:.2f}s",
         )
+
+    check(
+        "스트림 model 로컬 모델 일치",
+        chunk_models == {CHAT_MODEL},
+        f"수신 model {sorted(chunk_models)}",
+    )
 
     # 2. 형식이 깨진 요청은 게이트웨이가 OpenAI 규격 400으로 직접 거절한다(3단계 의결).
     broken = httpx.post(

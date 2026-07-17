@@ -40,6 +40,7 @@ from gateway.observability import (
     observe_stream,
     observe_upstream_start,
 )
+from gateway.relay_common import is_relayable_error_status
 from gateway.routing import EndpointKind, RoutingTable
 from gateway.validation import load_json_object, load_standard_json, require_string
 
@@ -107,10 +108,11 @@ async def create_embeddings(
         observe_local_failure("local_unreachable")
         return upstream_unavailable_response(error)
 
-    if 200 < upstream_response.status_code < 300:
-        observe_local_failure("local_invalid_body")
-        return upstream_invalid_response("embedding")
     if upstream_response.status_code != 200:
+        if not is_relayable_error_status(upstream_response.status_code):
+            # 200 아닌 2xx와 1xx·3xx — 유효한 임베딩 응답이 될 수 없는 상태이므로 502로 합성한다.
+            observe_local_failure("local_invalid_body")
+            return upstream_invalid_response("embedding")
         observe_provider("local")
         observe_response_start()
         return _upstream_error_response(upstream_response)

@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from time import monotonic
 
+import anyio.to_thread
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -42,8 +43,11 @@ class AuthenticationMiddleware:
         if api_key is None:
             await _unauthorized_response()(scope, receive, send)
             return
+        # 저장소 조회는 동기 파일 IO와 잠금 대기를 수반한다 — 워커 스레드로 옮겨 이벤트 루프를
+        # 막지 않되, 매 요청 파일을 다시 읽어 폐기를 즉시 반영하는 계약은 그대로 둔다.
+        store = self._store_provider()
         try:
-            identity = self._store_provider().authenticate(api_key)
+            identity = await anyio.to_thread.run_sync(store.authenticate, api_key)
         except ApiKeyStoreError:
             await _authentication_unavailable_response()(scope, receive, send)
             return

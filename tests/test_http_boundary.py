@@ -8,6 +8,7 @@ import httpx
 import pytest
 import respx
 from fastapi import FastAPI
+from pydantic import ValidationError
 
 from gateway.api_keys import ApiKeyStore
 from gateway.config import Settings, settings
@@ -241,6 +242,35 @@ async def test_deeply_nested_json_is_400_without_upstream_call(
 
 
 @respx.mock
+async def test_lone_surrogate_escape_is_400_without_upstream_call(
+    gateway_client: httpx.AsyncClient,
+) -> None:
+    # JSON escape로 들어온 고립 surrogate는 파싱은 통과하지만 응답 직렬화의 UTF-8
+    # 인코딩에서 터진다 — 500이 아니라 업스트림 미호출 400으로 경계에서 끝나야 한다.
+    upstream = respx.post(UPSTREAM_URL)
+
+    response = await gateway_client.post(
+        "/v1/chat/completions",
+        content=b'{"model": "\\ud800", "messages": []}',
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert not upstream.called
+
+
+def test_settings_reject_non_positive_operational_limits() -> None:
+    # 잘못된 운영 수치는 런타임 오동작이 아니라 기동 시점 검증 실패여야 한다.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, circuit_breaker_failure_threshold=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, circuit_breaker_open_seconds=-1.0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, upstream_read_timeout_seconds=0.0)
+
+
+@respx.mock
 async def test_deeply_nested_but_valid_json_still_reaches_upstream(
     gateway_client: httpx.AsyncClient,
 ) -> None:
@@ -254,7 +284,7 @@ async def test_deeply_nested_but_valid_json_still_reaches_upstream(
 
     response = await gateway_client.post("/v1/chat/completions", json=nested)
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     assert upstream.called
 
 
@@ -287,6 +317,9 @@ async def test_docs_are_public_cached_and_automatic_schema_routes_are_disabled(
     assert "https://&lt;public-host&gt;/v1" in docs.text
     assert "1024" in docs.text
     assert "1536" in docs.text
+    # 별칭·제한 표는 계약의 핵심이다 — 표가 문단으로 뭉개지는 렌더링 회귀를 고정한다.
+    assert "<table>" in docs.text
+    assert "<p>|" not in docs.text
     assert openapi.status_code == 404
     assert redoc.status_code == 404
 

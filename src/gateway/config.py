@@ -24,15 +24,23 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://127.0.0.1:11434"
     # embed 전용 로컬 Ollama(CPU) — chat·vision과 분리된 별도 인스턴스·주소다.
     embedding_ollama_base_url: str = "http://127.0.0.1:11435"
-    upstream_connect_timeout_seconds: float = 5.0
-    upstream_read_timeout_seconds: float = 120.0
-    local_response_start_timeout_seconds: float = Field(default=90.0, gt=0)
-    total_response_start_timeout_seconds: float = Field(default=115.0, gt=0)
+    upstream_connect_timeout_seconds: float = Field(
+        default=5.0, gt=0, allow_inf_nan=False
+    )
+    upstream_read_timeout_seconds: float = Field(
+        default=120.0, gt=0, allow_inf_nan=False
+    )
+    local_response_start_timeout_seconds: float = Field(
+        default=90.0, gt=0, allow_inf_nan=False
+    )
+    total_response_start_timeout_seconds: float = Field(
+        default=115.0, gt=0, allow_inf_nan=False
+    )
     routing_config_path: Path = Path("routing.yaml")
 
     # 별칭별 회로 차단기 — 연속 실패가 임계값에 닿으면 open_seconds 동안 로컬을 건너뛴다.
-    circuit_breaker_failure_threshold: int = 3
-    circuit_breaker_open_seconds: float = 30.0
+    circuit_breaker_failure_threshold: int = Field(default=3, ge=1)
+    circuit_breaker_open_seconds: float = Field(default=30.0, gt=0, allow_inf_nan=False)
 
     # 요청 관측 JSON Lines 로그 디렉터리 — 운영 기본은 상태 디렉터리 하위이고, 열 수 없으면
     # 기동에 실패한다. 검증·테스트는 이 값을 임시 경로로 바꿔 운영 로그와 격리한다.

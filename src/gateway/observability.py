@@ -21,6 +21,7 @@ from queue import SimpleQueue
 from time import monotonic, time
 from uuid import uuid4
 
+from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from gateway.errors import internal_server_error_response
@@ -235,6 +236,10 @@ class ObservabilityMiddleware:
         token = _current_observation.set(observation)
         try:
             await self._app(scope, receive, observed_send)
+        except ClientDisconnect:
+            # 본문 수신 중 클라이언트가 연결을 끊었다 — 게이트웨이 결함이 아니므로 500을 합성하지
+            # 않고 조용히 끝낸다. 기록은 finally가 completed=false로 남긴다.
+            pass
         except Exception:
             if not response_started:
                 await internal_server_error_response()(scope, receive, observed_send)

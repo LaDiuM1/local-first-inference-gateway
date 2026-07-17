@@ -7,7 +7,7 @@ from gateway.errors import InvalidRequestError
 
 
 def load_standard_json(body: bytes) -> object:
-    """비표준 상수와 유한 범위를 넘는 수를 허용하지 않고 JSON 한 값을 읽는다.
+    """비표준 상수, 유한 범위를 넘는 수, UTF-8 인코딩 불가 문자열 없이 JSON 한 값을 읽는다.
 
     표준 JSON으로 읽을 수 없는 입력은 종류와 무관하게 ValueError 하나로 드러낸다. 과도한 중첩은
     파서 재귀 한도를 넘겨 RecursionError가 되므로 여기서 같은 계약 위반으로 통일한다.
@@ -16,7 +16,7 @@ def load_standard_json(body: bytes) -> object:
         parsed = json.loads(body, parse_constant=_reject_nonstandard_constant)
     except RecursionError as error:
         raise ValueError("JSON nesting is too deep") from error
-    _reject_non_finite_numbers(parsed)
+    _reject_unrepresentable_values(parsed)
     return parsed
 
 
@@ -51,14 +51,28 @@ def _reject_nonstandard_constant(constant: str) -> object:
     raise ValueError(f"non-standard JSON constant: {constant}")
 
 
-def _reject_non_finite_numbers(parsed: object) -> None:
-    """`1e400`처럼 파싱 결과가 무한대가 되는 표준 표기까지 반복 없이 검사한다."""
+def _reject_unrepresentable_values(parsed: object) -> None:
+    """`1e400`처럼 무한대가 되는 수와 UTF-8로 인코딩할 수 없는 문자열을 반복 없이 검사한다.
+
+    JSON escape(`"\\ud800"`)로 들어온 고립 surrogate는 파싱은 통과하지만 응답·중계 직렬화의
+    UTF-8 인코딩에서 터진다 — 키를 포함한 모든 문자열을 경계에서 거절한다.
+    """
     pending = [parsed]
     while pending:
         value = pending.pop()
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError("JSON number is outside the finite range")
-        if isinstance(value, dict):
+        if isinstance(value, str):
+            _require_utf8_encodable(value)
+        elif isinstance(value, dict):
+            pending.extend(value.keys())
             pending.extend(value.values())
         elif isinstance(value, list):
             pending.extend(value)
+
+
+def _require_utf8_encodable(value: str) -> None:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("JSON string is not encodable as UTF-8") from error

@@ -83,6 +83,38 @@ def _chat_response(text: str, model: str = LOCAL_MODEL) -> dict:
 
 
 @respx.mock
+async def test_responses_accepts_explicit_stream_false(
+    responses_client: httpx.AsyncClient,
+) -> None:
+    # stream은 false만 지원한다 — 명시된 false가 거절되는 회귀를 양성 경계로 고정한다.
+    respx.post(LOCAL_URL).respond(200, json=_chat_response("스트림 없이 분석"))
+    request = _request()
+    request["stream"] = False
+
+    response = await responses_client.post("/v1/responses", json=request)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+
+
+@pytest.mark.parametrize("detail", ["auto", "low", "high"])
+@respx.mock
+async def test_responses_accepts_every_supported_image_detail(
+    responses_client: httpx.AsyncClient, detail: str
+) -> None:
+    local = respx.post(LOCAL_URL).respond(200, json=_chat_response("이미지 설명"))
+    request = _request()
+    request["input"][0]["content"][1]["detail"] = detail
+
+    response = await responses_client.post("/v1/responses", json=request)
+
+    assert response.status_code == 200
+    upstream = json.loads(local.calls.last.request.content)
+    image_part = upstream["messages"][-1]["content"][1]
+    assert image_part["image_url"]["detail"] == detail
+
+
+@respx.mock
 async def test_responses_converts_search_image_request_and_response(
     responses_client: httpx.AsyncClient,
 ) -> None:
@@ -96,6 +128,10 @@ async def test_responses_converts_search_image_request_and_response(
     assert body["object"] == "response"
     assert body["status"] == "completed"
     assert body["model"] == OPENAI_VISION_MODEL
+    # 도구 미지원이어도 공식 응답 객체 필수 필드는 채운다 — 엄격 SDK 검증 대비.
+    assert body["parallel_tool_calls"] is True
+    assert body["tool_choice"] == "auto"
+    assert body["tools"] == []
     assert body["output"][0]["content"] == [
         {"type": "output_text", "text": "빨간색 상품 사진", "annotations": []}
     ]

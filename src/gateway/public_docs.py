@@ -5,7 +5,7 @@ from pathlib import Path
 from markdown_it import MarkdownIt
 
 _HTML_SHELL = """<!doctype html>
-<html lang="en">
+<html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -39,5 +39,9 @@ def render_public_docs(path: Path) -> str:
         markdown = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         raise PublicDocsError("public API guide is unavailable") from error
-    renderer = MarkdownIt("commonmark", {"html": False, "linkify": False})
+    # 연동 가이드의 별칭·제한 표가 계약의 핵심이다 — CommonMark에는 표가 없어
+    # 명시적으로 켠다.
+    renderer = MarkdownIt("commonmark", {"html": False, "linkify": False}).enable(
+        "table"
+    )
     return _HTML_SHELL.replace("{content}", renderer.render(markdown))

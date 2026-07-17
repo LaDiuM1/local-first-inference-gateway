@@ -116,6 +116,14 @@ REQUIRED_ROUTE_BLOCKS = {
 }
 
 
+def test_blank_model_string_fails_clearly(tmp_path: Path) -> None:
+    # 공백뿐인 모델명은 빈 값과 같다 — 기동 시점에 실패시킨다.
+    blanked = VALID_CONFIG.replace("gemma4:12b-it-qat", '"   "', 1)
+
+    with pytest.raises(RoutingConfigError):
+        load_routing_table(_write_config(tmp_path, blanked))
+
+
 @pytest.mark.parametrize("dropped_alias", ["chat", "vision", "embed"])
 def test_missing_required_route_fails_clearly(
     tmp_path: Path, dropped_alias: str

@@ -192,7 +192,10 @@ async def test_fallback_receives_only_total_deadline_remainder(
         await anyio.sleep(0.1)
         return httpx.Response(503, json={"error": "down"})
 
+    fallback_attempts: list[bool] = []
+
     async def slow_fallback(request: httpx.Request) -> httpx.Response:
+        fallback_attempts.append(True)
         await anyio.sleep(0.2)
         return httpx.Response(200, json={"id": "too-late", "choices": []})
 
@@ -204,9 +207,49 @@ async def test_fallback_receives_only_total_deadline_remainder(
         response = await client.post("/v1/chat/completions", json=CHAT_REQUEST)
         elapsed = time.monotonic() - started
 
+    # 폴백이 실제로 호출되고도 잔여 기한을 넘겨 504가 된 경로임을 고정한다 —
+    # 폴백을 아예 건너뛰는 회귀가 같은 결과로 통과하지 않게 한다.
+    assert fallback_attempts
     assert response.status_code == 504
     assert response.json()["error"]["code"] == "response_start_timeout"
     assert elapsed < 0.27
+
+
+@respx.mock
+async def test_exhausted_local_deadline_falls_back_without_circuit_failure(
+    gateway_credentials: GatewayCredentials, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """시도 전 로컬 기한 소진은 로컬 결함이 아니다 — 회로에 실패를 쌓지 않는다."""
+    monkeypatch.setattr(settings, "local_response_start_timeout_seconds", 0.02)
+    monkeypatch.setattr(settings, "total_response_start_timeout_seconds", 5.0)
+    monkeypatch.setattr(settings, "openai_api_key", SecretStr("fake-openai-key"))
+
+    local = respx.post(LOCAL_URL).respond(200, json={"id": "local", "choices": []})
+    respx.post(OPENAI_URL).respond(200, json={"id": "openai", "choices": []})
+
+    def slow_body() -> AsyncIterator[bytes]:
+        async def stream() -> AsyncIterator[bytes]:
+            # 본문 수신이 로컬 기한을 소진하게 만든다 — 로컬 호출 전에 기한이 끝난다.
+            yield b'{"model": "chat", '
+            await anyio.sleep(0.06)
+            yield b'"messages": [{"role": "user", "content": "x"}]}'
+
+        return stream()
+
+    async with _gateway_client(gateway_credentials) as client:
+        # 회로 임계값(연속 3회)만큼 기한 소진 폴백을 반복해도 회로가 열리면 안 된다.
+        for _ in range(3):
+            response = await client.post(
+                "/v1/chat/completions",
+                content=slow_body(),
+                headers={"content-type": "application/json"},
+            )
+            assert response.json()["id"] == "openai"
+        assert not local.called
+        recovered = await client.post("/v1/chat/completions", json=CHAT_REQUEST)
+
+    assert recovered.json()["id"] == "local"
+    assert local.called
 
 
 @respx.mock

@@ -32,6 +32,8 @@ from gateway.relay_common import (
     BodyValidator,
     ManagedStreamingResponse,
     StreamCleanup,
+    close_response,
+    is_relayable_error_status,
     is_success_status,
     is_valid_chat_completion_body,
     iter_committed_stream,
@@ -80,10 +82,12 @@ class OpenAIFallback:
                 f"connection failed: {type(error).__name__}"
             )
         # 2xx인데 판정 기준을 통과한 응답이 아니면 비밀 없는 502로 합성한다.
-        # 오류 상태(비2xx)는 provider의 오류 본문을 그대로 클라이언트에 전달한다.
-        if is_success_status(response.status_code) and not body_validator(
-            response.content
-        ):
+        # 오류 상태(4xx·5xx)는 provider의 오류 본문을 그대로 클라이언트에 전달하고,
+        # 어느 쪽도 아닌 1xx·3xx는 무효 응답이므로 역시 비밀 없는 502로 합성한다.
+        if is_success_status(response.status_code):
+            if not body_validator(response.content):
+                return fallback_unavailable_response(_INVALID_RESPONSE_DETAIL)
+        elif not is_relayable_error_status(response.status_code):
             return fallback_unavailable_response(_INVALID_RESPONSE_DETAIL)
         observe_provider("openai")
         observe_response_start()
@@ -119,6 +123,10 @@ class OpenAIFallback:
 
     async def _prepare_stream_response(self, response: httpx.Response) -> Response:
         if not is_success_status(response.status_code):
+            if not is_relayable_error_status(response.status_code):
+                # 1xx·3xx — 유효한 응답도 전달 대상 오류도 아니므로 비밀 없는 502로 합성한다.
+                await close_response(response)
+                return fallback_unavailable_response(_INVALID_RESPONSE_DETAIL)
             # 오류 상태 — 본문을 읽어 그대로 전달한다(버퍼 경로와 같은 규칙).
             try:
                 body = await read_and_close_response(response)

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 96" width="880" role="img">
+  <title>local-first-inference-gateway</title>
+  <style>
+    .mono { font-family: ui-monospace, 'Cascadia Code', Consolas, 'Courier New', monospace; }
+    .wordmark { font-size: 24px; font-weight: 600; fill: #1f2328; letter-spacing: -0.01em; }
+    .stack { font-size: 12px; font-weight: 400; fill: #59636e; }
+  </style>
+
+  <rect x="0" y="0" width="880" height="96" rx="12" fill="#ffffff"/>
+  <text class="mono wordmark" x="440" y="44" text-anchor="middle">local-first-inference-gateway</text>
+  <path d="M280,60 H600" stroke="#d1d9e0" stroke-width="1"/>
+  <text class="mono stack" x="440" y="84" text-anchor="middle">Python 3.12 · FastAPI · Ollama · OpenAI 호환 /v1</text>
+</svg>

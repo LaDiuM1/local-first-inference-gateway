@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 88" width="880" role="img">
+  <title>실측 헤드라인 수치</title>
+  <style>
+    text { font-family: -apple-system, 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Helvetica Neue', Arial, sans-serif; }
+    .num { font-family: ui-monospace, 'Cascadia Code', Consolas, 'Courier New', monospace; font-size: 28px; font-weight: 600; fill: #1f2328; }
+    .unit { font-family: -apple-system, 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; font-size: 14px; font-weight: 400; fill: #59636e; }
+    .label { font-size: 12px; fill: #59636e; }
+  </style>
+
+  <rect x="0" y="0" width="880" height="88" rx="12" fill="#ffffff"/>
+  <path d="M220,10 V78" stroke="#d1d9e0" stroke-width="1"/>
+  <path d="M440,10 V78" stroke="#d1d9e0" stroke-width="1"/>
+  <path d="M660,10 V78" stroke="#d1d9e0" stroke-width="1"/>
+
+  <text class="num" x="110" y="46" text-anchor="middle">2.74<tspan class="unit"> 초</tspan></text>
+  <text class="label" x="110" y="74" text-anchor="middle">첫 토큰 p95</text>
+
+  <text class="num" x="330" y="46" text-anchor="middle">30.8<tspan class="unit"> tok/s</tspan></text>
+  <text class="label" x="330" y="74" text-anchor="middle">생성 속도</text>
+
+  <text class="num" x="550" y="46" text-anchor="middle">8.89</text>
+  <text class="label" x="550" y="74" text-anchor="middle">생성 품질 · 블라인드 심판</text>
+
+  <text class="num" x="770" y="46" text-anchor="middle">0.028<tspan class="unit"> 원</tspan></text>
+  <text class="label" x="770" y="74" text-anchor="middle">질의당 추가 전기요금</text>
+</svg>
